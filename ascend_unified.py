@@ -55,7 +55,7 @@ from flask_cors import CORS
 class Config:
     # Connection
     SERIAL_PORT = "COM13" if os.name == "nt" else "/dev/ttyACM0"
-    BAUD_RATE = 9600
+    BAUD_RATE = 57600
     WEB_PORT = 5000
 
     # D435i streams
@@ -461,9 +461,8 @@ class MAVLinkHandler:
         ts = int((time.time() - self.boot_time) * 1e6)
         # Tight covariance for velocity: extreme confidence in vector
         cov = [0.005, 0, 0,
-               0.005, 0,
-               0.02,
-               0, 0, 0]  # EKF expects 9-element array
+               0, 0.005, 0,
+               0, 0, 0.02]  # Row-major 3x3 covariance
         try:
             self.conn.mav.vision_speed_estimate_send(
                 ts, float(vx), float(vy), float(vz),
@@ -1085,11 +1084,16 @@ class VisionEngine:
                                 self.prev_points = cv2.goodFeaturesToTrack(
                                     gray, **self.feat_params
                                 )
-                            if self.prev_points is not None:
-                                cv2.cornerSubPix(
-                                    gray, self.prev_points, (5, 5), (-1, -1),
-                                    (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
-                                )
+                                if self.prev_points is not None:
+                                    cv2.cornerSubPix(
+                                        gray, self.prev_points, (5, 5), (-1, -1),
+                                        (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
+                                    )
+                            else:
+                                self.prev_points = good_next.reshape(-1, 1, 2)
+
+                # --- Dense Farneback fallback ---
+                if not sparse_ok and self.config.DENSE_FALLBACK:
                     flow = cv2.calcOpticalFlowFarneback(
                         self.prev_gray, gray, None,
                         0.5, 3, 15, 3, 5, 1.2, 0
@@ -1670,6 +1674,8 @@ def main():
     parser.add_argument("--yaw", type=float, default=0, help="Camera yaw degrees")
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--demo", action="store_true", help="Run with simulated data")
+    parser.add_argument("--dense-fallback", action="store_true",
+                        help="Enable dense Farneback fallback only when sparse flow fails")
     parser.add_argument("--allow-auto-mode", action="store_true",
                         help="Allow AUTO mode changes from the web API")
     parser.add_argument("--allow-unsafe-modes", action="store_true",
@@ -1683,6 +1689,7 @@ def main():
     config.CAM_YAW = args.yaw
     config.DEBUG = args.debug
     config.DEMO = args.demo
+    config.DENSE_FALLBACK = args.dense_fallback
     config.ALLOW_AUTO_MODE = args.allow_auto_mode
     config.ALLOW_UNSAFE_MODES = args.allow_unsafe_modes
     telemetry_state.HEARTBEAT_STALE_SEC = config.HEARTBEAT_TIMEOUT
