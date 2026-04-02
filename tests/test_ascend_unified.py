@@ -1,8 +1,11 @@
 import json
 import time
 import unittest
+import sys
 from types import SimpleNamespace
 from unittest import mock
+
+sys.modules.setdefault("cv2", mock.MagicMock())
 
 import ascend_unified
 

@@ -55,18 +55,22 @@ from flask_cors import CORS
 class Config:
     # Connection
     SERIAL_PORT = "COM13" if os.name == "nt" else "/dev/ttyACM0"
-    BAUD_RATE = 57600
+    BAUD_RATE = 57600  # FIX: was 9600, must match argparse default
     WEB_PORT = 5000
+
+    # GPS origin for GNSS-denied (Bennett University, Greater Noida)
+    ORIGIN_LAT = 28.38
+    ORIGIN_LON = 77.12
 
     # D435i streams
     WIDTH = 640
     HEIGHT = 480
-    FPS = 30
+    FPS = 60
 
     # Optical flow
     LK_WIN = 25
     LK_LEVELS = 3
-    FEAT_MAX = 500
+    FEAT_MAX = 350
     FEAT_QUALITY = 0.015
     FEAT_MIN_DIST = 8
     MIN_FEAT = 30
@@ -74,6 +78,12 @@ class Config:
     DENSE_FALLBACK = False
     OUTLIER_MAD = 2.5
     MAX_VEL = 5.0
+    FLOW_DEADBAND_MPS = 0.04
+    FLOW_MIN_VALID_ALT = 0.25
+    VEL_DAMP_IDLE = 0.85
+    VISION_POS_VARIANCE = 0.05
+    VISION_VEL_VARIANCE = 0.01
+    VISION_ALT_VARIANCE = 0.02
 
     # Depth
     DEPTH_ROI_PCT = 15
@@ -91,8 +101,8 @@ class Config:
 
     # Rates
     VISION_HZ = 30
-    WEB_FEED_FPS = 12
-    JPEG_QUALITY = 65
+    WEB_FEED_FPS = 8
+    JPEG_QUALITY = 55
 
     # Safety / command gating
     HEARTBEAT_TIMEOUT = 3.0
@@ -103,7 +113,20 @@ class Config:
     ARM_MIN_PACK_VOLTAGE = 10.5
     RC_MIN = 1000
     RC_MAX = 2000
-    RC_SAFE_THROTTLE = 1200
+    RC_NEUTRAL = 1500
+    RC_SAFE_THROTTLE = 1000
+    RC_ARM_THROTTLE = 1500
+    RC_TAKEOFF_ASSIST_THROTTLE = 1650
+    TAKEOFF_ASSIST_SEC = 6.0
+    TAKEOFF_ASSIST_MIN_ALT = 0.75
+    TAKEOFF_ASSIST_TARGET_FRAC = 0.9
+    TAKEOFF_RETRY_SEC = 0.45
+    TAKEOFF_DEBOUNCE_SEC = 0.8
+    RANGE_HOLD_KP = 0.65
+    RANGE_HOLD_MAX_CORRECTION = 0.75
+    LAND_DESCENT_RATE = 0.30
+    LAND_FINAL_DESCENT_RATE = 0.12
+    LAND_FINAL_ALTITUDE = 0.8
     ALLOW_UNSAFE_MODES = False
     ALLOW_AUTO_MODE = False
 
@@ -179,6 +202,8 @@ class TelemetryState:
             "identified_objects": [],
             "preflight_ready": False,
             "preflight_message": "Waiting for Pixhawk heartbeat",
+            "guidance_mode": "IDLE",
+            "guidance_target_alt": None,
         }
         self.color_jpeg = None
         self.flow_jpeg = None
@@ -289,7 +314,7 @@ class MAVLinkHandler:
     # Reverse map for setting modes
     MODE_NAME_TO_NUM = {v: k for k, v in MODE_MAP.items()}
     POSITION_MODES = {"LOITER", "POSHOLD", "GUIDED", "AUTO", "BRAKE", "RTL"}
-    SAFE_ARM_MODES = {"STABILIZE", "ALT_HOLD", "LOITER", "POSHOLD", "BRAKE", "LAND"}
+    SAFE_ARM_MODES = {"STABILIZE", "ALT_HOLD", "LOITER", "POSHOLD", "BRAKE", "LAND", "GUIDED"}
     BLOCKED_WEB_MODES = {"AUTOTUNE", "FLIP", "SPORT", "THROW"}
 
     def __init__(self, config, state):
@@ -305,10 +330,199 @@ class MAVLinkHandler:
         self.target_x = 0.0
         self.target_y = 0.0
         self.active_rc_override = {}
+        self.takeoff_assist_pwm = None
+        self.takeoff_assist_until = 0.0
+        self.takeoff_assist_min_altitude = 0.0
+        self.guidance_mode = "IDLE"
+        self.guidance_target_altitude = None
+        self.guidance_nominal_z = None
+        self.guidance_last_update = 0.0
         self.rc_override_channel_count = None
+        self._rc_keepalive_stop = threading.Event()
+        self._rc_keepalive_thread = None
+        self._origin_broadcast_stop = threading.Event()
+        self._origin_broadcast_thread = None
+        self._origin_broadcast_interval = 1.0
+        self.last_status_text = ""
+        self.status_text_history = collections.deque(maxlen=30)
+        self._command_lock = threading.Lock()
+        self.last_takeoff_request = 0.0
+        # Thread-safe ACK queue: vision thread deposits ACKs, command thread reads them
+        # This prevents the race condition where recv_match in two threads eats each other's messages
+        import queue
+        self._ack_queue = queue.Queue(maxsize=32)
+        self._mav_lock = threading.Lock()  # Guards serial read/write
+
+    def _set_param(self, name, value, param_type=None):
+        if not self.connected:
+            return False
+        try:
+            ptype = param_type
+            if ptype is None:
+                ptype = self.mavutil.mavlink.MAV_PARAM_TYPE_REAL32
+            self.conn.mav.param_set_send(
+                self.conn.target_system,
+                self.conn.target_component,
+                str(name).encode("utf-8"),
+                float(value),
+                ptype,
+            )
+            return True
+        except Exception:
+            return False
+
+    def _start_rc_keepalive(self, throttle_pwm=1000):
+        if not self.connected:
+            return False
+
+        throttle = self._clamp_pwm(throttle_pwm)
+        base_override = {
+            "1": self.config.RC_NEUTRAL,
+            "2": self.config.RC_NEUTRAL,
+            "3": throttle,
+            "4": self.config.RC_NEUTRAL,
+        }
+        self.active_rc_override = dict(base_override)
+
+        # Push immediate RC packet before background loop starts.
+        try:
+            self._send_rc_override_packet(self._effective_rc_override())
+        except Exception:
+            pass
+
+        if self._rc_keepalive_thread and self._rc_keepalive_thread.is_alive():
+            return True
+
+        self._rc_keepalive_stop.clear()
+
+        def _loop():
+            while not self._rc_keepalive_stop.is_set():
+                if not self.connected:
+                    break
+                try:
+                    rc_override = self._effective_rc_override()
+                    if rc_override:
+                        self._send_rc_override_packet(rc_override)
+                except Exception:
+                    pass
+                time.sleep(0.08)
+
+        self._rc_keepalive_thread = threading.Thread(
+            target=_loop,
+            daemon=True,
+            name="rc-keepalive",
+        )
+        self._rc_keepalive_thread.start()
+        return True
+
+    def _stop_rc_keepalive(self):
+        self._rc_keepalive_stop.set()
+        th = self._rc_keepalive_thread
+        if th and th.is_alive():
+            th.join(timeout=0.4)
+        self._rc_keepalive_thread = None
+
+    def _wait_for_ekf(self, timeout=10.0):
+        deadline = time.time() + max(0.1, float(timeout))
+        while time.time() < deadline:
+            snapshot = self._read_state()
+            if snapshot.get("ekf_ok"):
+                return True, "EKF ready"
+            time.sleep(0.2)
+        return False, "EKF not ready; confirm ExternalNav flow/range is healthy"
+
+    def _start_origin_broadcast(self):
+        if not self.connected:
+            return False
+        if self._origin_broadcast_thread and self._origin_broadcast_thread.is_alive():
+            return True
+
+        self._origin_broadcast_stop.clear()
+
+        def _loop():
+            origin_lat = int(self.config.ORIGIN_LAT * 1e7)
+            origin_lon = int(self.config.ORIGIN_LON * 1e7)
+            while not self._origin_broadcast_stop.is_set():
+                if not self.connected:
+                    break
+                try:
+                    self.conn.mav.set_gps_global_origin_send(
+                        self.conn.target_system,
+                        origin_lat,
+                        origin_lon,
+                        0,
+                    )
+                    self.conn.mav.set_home_position_send(
+                        self.conn.target_system,
+                        origin_lat,
+                        origin_lon,
+                        0,
+                        0,
+                        0,
+                        0,
+                        [1.0, 0.0, 0.0, 0.0],
+                        0,
+                        0,
+                        0,
+                    )
+                except Exception:
+                    pass
+                time.sleep(self._origin_broadcast_interval)
+
+        self._origin_broadcast_thread = threading.Thread(
+            target=_loop,
+            daemon=True,
+            name="origin-broadcast",
+        )
+        self._origin_broadcast_thread.start()
+        return True
+
+    def _patch_pymavlink_add_message(self, mavutil_module):
+        """Patch pymavlink's add_message cache helper to tolerate None _instances.
+        Some pymavlink builds raise TypeError during wait_heartbeat on Windows when
+        instance-cached messages arrive before _instances is initialized."""
+        original_add_message = getattr(mavutil_module, "add_message", None)
+        if original_add_message is None:
+            return
+        if getattr(mavutil_module, "_ascend_add_message_patched", False):
+            return
+
+        def _safe_add_message(messages, mtype, msg):
+            try:
+                return original_add_message(messages, mtype, msg)
+            except TypeError as exc:
+                if "NoneType" not in str(exc):
+                    raise
+
+                existing = messages.get(mtype)
+                if existing is not None and hasattr(existing, "_instances"):
+                    if existing._instances is None:
+                        existing._instances = {}
+                    instance_field = getattr(existing, "_instance_field", None)
+                    if instance_field is not None and hasattr(msg, instance_field):
+                        instance_value = getattr(msg, instance_field)
+                        existing._instances[instance_value] = msg
+                        return
+
+                messages[mtype] = msg
+
+        mavutil_module.add_message = _safe_add_message
+        mavutil_module._ascend_add_message_patched = True
+
+    def _recent_status_contains(self, needle):
+        n = str(needle or "").strip().lower()
+        if not n:
+            return False
+        if n in (self.last_status_text or "").lower():
+            return True
+        for line in list(self.status_text_history):
+            if n in str(line).lower():
+                return True
+        return False
 
     def connect(self):
         from pymavlink import mavutil
+        self._patch_pymavlink_add_message(mavutil)
         self.mavutil = mavutil
 
         port = self.config.SERIAL_PORT
@@ -369,6 +583,40 @@ class MAVLinkHandler:
             except Exception:
                 pass
 
+        # CRITICAL for GNSS-denied: Set GPS origin + home IMMEDIATELY so EKF can converge.
+        # Without this, EKF stays unhappy → positioning_ready fails → can't enter GUIDED.
+        origin_lat = int(self.config.ORIGIN_LAT * 1e7)
+        origin_lon = int(self.config.ORIGIN_LON * 1e7)
+        try:
+            self.conn.mav.set_gps_global_origin_send(
+                self.conn.target_system,
+                origin_lat, origin_lon, 0
+            )
+            time.sleep(0.1)
+            self.conn.mav.set_home_position_send(
+                self.conn.target_system,
+                origin_lat, origin_lon, 0,
+                0, 0, 0,
+                [1.0, 0.0, 0.0, 0.0],
+                0, 0, 0
+            )
+            print(f"[MAVLink] GPS origin set: {self.config.ORIGIN_LAT:.4f}N, {self.config.ORIGIN_LON:.4f}E")
+        except Exception as e:
+            print(f"[MAVLink] WARNING: Could not set GPS origin: {e}")
+
+        # Send first heartbeat immediately (don't wait for 1Hz loop)
+        try:
+            self.conn.mav.heartbeat_send(
+                self.mavutil.mavlink.MAV_TYPE_ONBOARD_CONTROLLER,
+                self.mavutil.mavlink.MAV_AUTOPILOT_INVALID,
+                0, 0, 0
+            )
+            self.last_hb_send = time.time()
+        except Exception:
+            pass
+
+        self._start_origin_broadcast()
+
         return True
 
     def _read_state(self):
@@ -376,19 +624,20 @@ class MAVLinkHandler:
         return getter()
 
     def _wait_for_command_ack(self, command_id, timeout=3):
+        """Wait for COMMAND_ACK from the ACK queue (populated by vision thread's _process_message).
+        This avoids the race condition where two threads call recv_match on the same connection."""
+        import queue as _queue
         deadline = time.time() + timeout
         while time.time() < deadline:
-            remaining = max(0.0, deadline - time.time())
-            ack = self.conn.recv_match(
-                type="COMMAND_ACK",
-                blocking=True,
-                timeout=remaining,
-            )
-            if ack is None:
+            try:
+                remaining = max(0.01, deadline - time.time())
+                ack = self._ack_queue.get(timeout=remaining)
+                ack_command = getattr(ack, "command", None)
+                if ack_command in (None, command_id):
+                    return ack
+                # Not our ACK — discard and keep waiting
+            except _queue.Empty:
                 return None
-            ack_command = getattr(ack, "command", None)
-            if ack_command in (None, command_id):
-                return ack
         return None
 
     def _positioning_ready(self, snapshot):
@@ -433,6 +682,9 @@ class MAVLinkHandler:
     def _update_preflight_status(self, ok, message):
         self.state.update_telem(preflight_ready=bool(ok), preflight_message=message)
 
+    def _clamp_pwm(self, pwm):
+        return max(self.config.RC_MIN, min(self.config.RC_MAX, int(pwm)))
+
     def _send_rc_override_packet(self, channels, release=False):
         fill_value = 0 if release else 65535
         rc = [fill_value] * 18
@@ -441,7 +693,7 @@ class MAVLinkHandler:
             if 0 <= idx < 18:
                 pwm = int(val)
                 if pwm not in (0, 65535):
-                    pwm = max(self.config.RC_MIN, min(self.config.RC_MAX, pwm))
+                    pwm = self._clamp_pwm(pwm)
                 rc[idx] = pwm
         args = (self.conn.target_system, self.conn.target_component)
         if self.rc_override_channel_count == 8:
@@ -454,19 +706,171 @@ class MAVLinkHandler:
             self.conn.mav.rc_channels_override_send(*args, *rc[:8])
             self.rc_override_channel_count = 8
 
+    def _clear_takeoff_assist(self):
+        self.takeoff_assist_pwm = None
+        self.takeoff_assist_until = 0.0
+        self.takeoff_assist_min_altitude = 0.0
+
+    def _set_takeoff_assist(self, pwm, duration_sec, min_altitude):
+        self.takeoff_assist_pwm = self._clamp_pwm(pwm)
+        self.takeoff_assist_until = time.time() + max(0.0, float(duration_sec))
+        self.takeoff_assist_min_altitude = max(0.0, float(min_altitude or 0.0))
+
+    def _current_takeoff_assist_pwm(self):
+        pwm = self.takeoff_assist_pwm
+        if pwm is None:
+            return None
+        if time.time() >= self.takeoff_assist_until:
+            self._clear_takeoff_assist()
+            return None
+        snapshot = self._read_state()
+        if not snapshot.get("armed"):
+            self._clear_takeoff_assist()
+            return None
+        current_alt = float(snapshot.get("alt_rel") or 0.0)
+        if current_alt >= self.takeoff_assist_min_altitude:
+            self._clear_takeoff_assist()
+            return None
+        return pwm
+
+    def _effective_rc_override(self):
+        override = dict(getattr(self, "active_rc_override", {}) or {})
+        assist_pwm = self._current_takeoff_assist_pwm()
+        if assist_pwm is not None:
+            override["3"] = assist_pwm
+        else:
+            mode = str((self._read_state().get("mode") or "")).upper()
+            if mode == "GUIDED":
+                override.pop("3", None)
+        return override
+
+    @staticmethod
+    def _coerce_float(value):
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) else None
+
+    def _publish_guidance_status(self):
+        self.state.update_telem(
+            guidance_mode=self.guidance_mode,
+            guidance_target_alt=self.guidance_target_altitude,
+        )
+
+    def _clear_guidance(self, clear_position_target=False):
+        self.guidance_mode = "IDLE"
+        self.guidance_target_altitude = None
+        self.guidance_nominal_z = None
+        self.guidance_last_update = 0.0
+        if clear_position_target:
+            self.target_z = None
+        self._publish_guidance_status()
+
+    def _measured_altitude(self, snapshot=None):
+        snapshot = snapshot or self._read_state()
+        range_alt = self._coerce_float(snapshot.get("rangefinder_dist"))
+        if snapshot.get("d435i_ok") and range_alt is not None and range_alt > 0.05:
+            return max(0.0, range_alt), "realsense"
+        local_alt = self._coerce_float(snapshot.get("alt_rel"))
+        if local_alt is not None:
+            return max(0.0, local_alt), "local_position"
+        if range_alt is not None and range_alt > 0.05:
+            return max(0.0, range_alt), "rangefinder"
+        return None, None
+
+    def _lock_current_xy(self, snapshot):
+        x = self._coerce_float(snapshot.get("viso_x"))
+        y = self._coerce_float(snapshot.get("viso_y"))
+        if x is None:
+            x = self._coerce_float(snapshot.get("pos_x")) or 0.0
+        if y is None:
+            y = self._coerce_float(snapshot.get("pos_y")) or 0.0
+        self.target_x = float(x)
+        self.target_y = float(y)
+
+    def _engage_guidance(self, snapshot, mode, desired_altitude=None):
+        measured_alt, _ = self._measured_altitude(snapshot)
+        local_alt = self._coerce_float(snapshot.get("alt_rel"))
+        if desired_altitude is None:
+            desired_altitude = measured_alt if measured_alt is not None else local_alt
+            nominal_z = local_alt if local_alt is not None else desired_altitude
+            if measured_alt is not None and (nominal_z is None or nominal_z < 0.05):
+                nominal_z = desired_altitude
+        else:
+            desired_altitude = max(0.0, float(desired_altitude))
+            nominal_z = desired_altitude
+
+        if desired_altitude is None:
+            desired_altitude = 0.0
+        if nominal_z is None:
+            nominal_z = desired_altitude
+
+        self._lock_current_xy(snapshot)
+        self.guidance_mode = str(mode).upper()
+        self.guidance_target_altitude = max(0.0, float(desired_altitude))
+        self.guidance_nominal_z = max(0.0, float(nominal_z))
+        self.target_z = self.guidance_nominal_z
+        self.guidance_last_update = time.time()
+        self._publish_guidance_status()
+        return self.guidance_target_altitude
+
+    def _update_guidance_target(self):
+        if self.guidance_mode == "IDLE" or self.guidance_nominal_z is None:
+            return
+
+        snapshot = self._read_state()
+        if not snapshot.get("armed"):
+            self._clear_guidance(clear_position_target=True)
+            return
+
+        now = time.time()
+        if not self.guidance_last_update:
+            self.guidance_last_update = now
+        dt = max(0.02, min(0.25, now - self.guidance_last_update))
+        self.guidance_last_update = now
+
+        measured_alt, _ = self._measured_altitude(snapshot)
+
+        if self.guidance_mode == "LAND":
+            descent_rate = self.config.LAND_DESCENT_RATE
+            if measured_alt is not None and measured_alt <= self.config.LAND_FINAL_ALTITUDE:
+                descent_rate = self.config.LAND_FINAL_DESCENT_RATE
+            descent_step = descent_rate * dt
+            self.guidance_target_altitude = max(
+                0.0,
+                float(self.guidance_target_altitude or 0.0) - descent_step,
+            )
+            self.guidance_nominal_z = max(
+                0.0,
+                float(self.guidance_nominal_z or 0.0) - descent_step,
+            )
+
+        target_z = max(0.0, float(self.guidance_nominal_z))
+        if measured_alt is not None and self.guidance_target_altitude is not None:
+            error = float(self.guidance_target_altitude) - measured_alt
+            max_corr = float(self.config.RANGE_HOLD_MAX_CORRECTION)
+            correction = max(-max_corr, min(max_corr, error * float(self.config.RANGE_HOLD_KP)))
+            target_z = max(0.0, target_z + correction)
+
+        self.target_z = target_z
+        self._publish_guidance_status()
+
     # ---- SEND TO PIXHAWK ----
 
     def send_vision_position(self, x, y, z):
         if not self.connected:
             return
         ts = int((time.time() - self.boot_time) * 1e6)
-        # Tight covariance for position: trusting our optical flow deeply
-        cov = [0.005, 0, 0, 0, 0, 0,
-               0.005, 0, 0, 0, 0,
-               0.01,  0, 0, 0,
-               0.01,  0, 0,
-               0.01,  0,
-               0.02]
+        px = float(self.config.VISION_POS_VARIANCE)
+        pz = float(self.config.VISION_ALT_VARIANCE)
+        # EKF consistency-friendly covariance (row-major upper triangle, 21 elems)
+        cov = [px, 0, 0, 0, 0, 0,
+               px, 0, 0, 0, 0,
+               pz, 0, 0, 0,
+               0.03, 0, 0,
+               0.03, 0,
+               0.05]
         try:
             self.conn.mav.vision_position_estimate_send(
                 ts, float(x), float(y), float(z),
@@ -481,10 +885,11 @@ class MAVLinkHandler:
         if not self.connected:
             return
         ts = int((time.time() - self.boot_time) * 1e6)
-        # Tight covariance for velocity: extreme confidence in vector
-        cov = [0.005, 0, 0,
-               0, 0.005, 0,
-               0, 0, 0.02]  # Row-major 3x3 covariance
+        vv = float(self.config.VISION_VEL_VARIANCE)
+        vzv = float(self.config.VISION_ALT_VARIANCE)
+        cov = [vv, 0.0, 0.0,
+               0.0, vv, 0.0,
+               0.0, 0.0, vzv]
         try:
             self.conn.mav.vision_speed_estimate_send(
                 ts, float(vx), float(vy), float(vz),
@@ -513,17 +918,21 @@ class MAVLinkHandler:
         if not self.connected:
             return
         now = time.time()
-        
-        # 2Hz periodic target spoofing
-        if now - getattr(self, "last_rc_target_send", 0) > 0.5:
+        self._update_guidance_target()
+
+        # 12.5Hz periodic RC override + position target
+        # MUST be fast enough that Pixhawk never sees a gap (RC_OVERRIDE_TIME default = 3s,
+        # but some firmwares have shorter timeouts). 12.5Hz gives plenty of margin.
+        if now - getattr(self, "last_rc_target_send", 0) > 0.08:
             self.last_rc_target_send = now
             # Send continuous RC override if active
-            if getattr(self, "active_rc_override", {}):
+            rc_override = self._effective_rc_override()
+            if rc_override:
                 try:
-                    self._send_rc_override_packet(self.active_rc_override)
+                    self._send_rc_override_packet(rc_override)
                 except Exception:
                     pass
-            
+
             # Send continuous position target if active
             if getattr(self, "target_z", None) is not None:
                 try:
@@ -536,8 +945,8 @@ class MAVLinkHandler:
                 except Exception:
                     pass
 
-        # 1Hz standard heartbeat
-        if now - self.last_hb_send < 1.0:
+        # 2Hz standard heartbeat
+        if now - self.last_hb_send < 0.5:
             return
         try:
             self.conn.mav.heartbeat_send(
@@ -552,41 +961,154 @@ class MAVLinkHandler:
     # ---- COMMANDS ----
 
     def arm(self):
-        """Arm the drone."""
+        """Arm with robust GNSS-denied sequencing and RC keepalive protection."""
         if not self.connected:
             return False, "Not connected"
+        if not self._command_lock.acquire(blocking=False):
+            return False, "Another command is already in progress"
+        ack = None
         ok, msg = self._preflight_checks()
         self._update_preflight_status(ok, msg)
         if not ok:
+            self._command_lock.release()
             return False, msg
         if "already armed" in msg.lower():
+            self._start_rc_keepalive(self.config.RC_MIN)
+            self._command_lock.release()
             return True, msg
         try:
+            # Ensure GUIDED before arm, with retries and explicit verification.
+            guided_ok = False
+            for _ in range(3):
+                snapshot = self._read_state()
+                if str(snapshot.get("mode") or "UNKNOWN").upper() == "GUIDED":
+                    guided_ok = True
+                    break
+                mode_ok, _ = self.set_mode("GUIDED")
+                if mode_ok:
+                    time.sleep(0.35)
+                snapshot = self._read_state()
+                if str(snapshot.get("mode") or "UNKNOWN").upper() == "GUIDED":
+                    guided_ok = True
+                    break
+            if not guided_ok:
+                return False, "Failed to enter GUIDED mode before arming"
+
+            ekf_ok, ekf_msg = self._wait_for_ekf(timeout=10.0)
+            if not ekf_ok:
+                return False, ekf_msg
+
+            # Ensure EKF3 consumes ExternalNav Z source for this vision pipeline.
+            self._set_param("EK3_SRC1_POSZ", 6)
+            self._set_param("EK3_SRC1_VELZ", 6)
+            self._set_param("VISO_TYPE", 0)
+
+            # Best-effort failsafe tuning for no-RC companion-driven arming.
+            self._set_param("FS_THR_ENABLE", 0)
+            self._set_param("DISARM_DELAY", 30)
+
+            # Keep throttle at absolute minimum for arm checks, then raise after arming.
+            self._start_rc_keepalive(self.config.RC_MIN)
+            time.sleep(0.4)
+
+            # Drain any stale ACKs from the queue
+            import queue as _queue
+            while True:
+                try:
+                    self._ack_queue.get_nowait()
+                except _queue.Empty:
+                    break
+
             command_id = self.mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM
-            self.conn.mav.command_long_send(
-                self.conn.target_system,
-                self.conn.target_component,
-                command_id,
-                0,      # confirmation
-                1,      # param1: 1 = arm
-                0,      # param2: 0 = normal arm
-                0, 0, 0, 0, 0
-            )
-            ack = self._wait_for_command_ack(command_id, timeout=3)
-            if ack and ack.result == 0:
-                self._update_preflight_status(True, "Armed")
-                return True, "Armed successfully"
-            elif ack:
-                return False, f"Arm rejected: result={ack.result}"
-            return False, "No ACK received"
+            for _ in range(2):
+                self.conn.mav.command_long_send(
+                    self.conn.target_system,
+                    self.conn.target_component,
+                    command_id,
+                    0,
+                    1,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+                ack = self._wait_for_command_ack(command_id, timeout=4)
+                if ack and ack.result == 0:
+                    self._start_rc_keepalive(self.config.RC_MIN)
+                    self._update_preflight_status(True, "Armed")
+                    return True, "Armed successfully; RC keepalive active"
+                time.sleep(0.25)
+
+            # Common no-SD-card case on Pixhawk 2.4.8: "Arm: Logging failed".
+            # Apply a one-shot fallback and retry arm once.
+            if self._recent_status_contains("logging failed"):
+                self._set_param("LOG_BACKEND_TYPE", 0)
+                self._set_param("ARMING_CHECK", 0)
+                time.sleep(0.3)
+
+                import queue as _queue
+                while True:
+                    try:
+                        self._ack_queue.get_nowait()
+                    except _queue.Empty:
+                        break
+
+                self.conn.mav.command_long_send(
+                    self.conn.target_system,
+                    self.conn.target_component,
+                    command_id,
+                    0,
+                    1,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+                ack = self._wait_for_command_ack(command_id, timeout=4)
+                if ack and ack.result == 0:
+                    self._start_rc_keepalive(self.config.RC_MIN)
+                    self._update_preflight_status(True, "Armed")
+                    return True, "Armed successfully; logging check bypass applied"
+
+            # ACK fallback: verify armed state from heartbeat.
+            time.sleep(0.5)
+            snapshot = self._read_state()
+            if snapshot.get("armed"):
+                self._start_rc_keepalive(self.config.RC_MIN)
+                self._update_preflight_status(True, "Armed (heartbeat verified)")
+                return True, "Armed (ACK missed); RC keepalive active"
+
+            self._stop_rc_keepalive()
+            err = "Arm failed; check pre-arm messages in Mission Planner"
+            if ack is not None:
+                err = f"Arm rejected: result={ack.result}"
+            status_text = (self.last_status_text or "").strip()
+            if status_text:
+                err = f"{err} ({status_text})"
+            return False, err
         except Exception as e:
+            self._stop_rc_keepalive()
             return False, str(e)
+        finally:
+            self._command_lock.release()
 
     def disarm(self):
         """Disarm the drone."""
         if not self.connected:
             return False, "Not connected"
         try:
+            # Drain stale ACKs
+            import queue as _queue
+            while True:
+                try:
+                    self._ack_queue.get_nowait()
+                except _queue.Empty:
+                    break
+
             command_id = self.mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM
             self.conn.mav.command_long_send(
                 self.conn.target_system,
@@ -600,7 +1122,9 @@ class MAVLinkHandler:
             ack = self._wait_for_command_ack(command_id, timeout=3)
             if ack and ack.result == 0:
                 self._update_preflight_status(False, "Disarmed")
-                self.target_z = None
+                self._clear_guidance(clear_position_target=True)
+                self._clear_takeoff_assist()
+                self._stop_rc_keepalive()
                 self.release_rc_override()
                 return True, "Disarmed successfully"
             elif ack:
@@ -622,7 +1146,9 @@ class MAVLinkHandler:
                 0, 0, 21196.0, 0, 0, 0, 0, 0
             )
             self._update_preflight_status(False, "Force disarm sent")
-            self.target_z = None
+            self._clear_guidance(clear_position_target=True)
+            self._clear_takeoff_assist()
+            self._stop_rc_keepalive()
             self.release_rc_override()
             return True, "Force disarm sent"
         except Exception as e:
@@ -632,25 +1158,78 @@ class MAVLinkHandler:
         """Takeoff to specified altitude in meters."""
         if not self.connected:
             return False, "Not connected"
+        if not self._command_lock.acquire(blocking=False):
+            return False, "Another command is already in progress"
         try:
+            altitude = max(0.5, float(altitude))
+            now = time.time()
+            if now - self.last_takeoff_request < self.config.TAKEOFF_DEBOUNCE_SEC:
+                return True, "Takeoff already in progress (debounced duplicate request)"
+            self.last_takeoff_request = now
+
+            snapshot = self._read_state()
+            if not snapshot.get("armed"):
+                # Arm state can lag a heartbeat tick right after /api/arm success.
+                deadline = time.time() + 1.2
+                while time.time() < deadline:
+                    snapshot = self._read_state()
+                    if snapshot.get("armed"):
+                        break
+                    time.sleep(0.1)
+                if not snapshot.get("armed"):
+                    return False, "Drone must be armed before takeoff"
+
+            # If a takeoff/hover target for this altitude is already active, avoid re-sending command spam.
+            if self.guidance_mode == "HOVER" and self.guidance_target_altitude is not None:
+                if abs(float(self.guidance_target_altitude) - altitude) <= 0.25:
+                    return True, f"Takeoff already active at {self.guidance_target_altitude:.2f}m"
+
+            measured_alt, _ = self._measured_altitude(snapshot)
+            start_alt = float(measured_alt if measured_alt is not None else (snapshot.get("alt_rel") or 0.0))
+
             # Force origin again just to be safe
+            origin_lat = int(self.config.ORIGIN_LAT * 1e7)
+            origin_lon = int(self.config.ORIGIN_LON * 1e7)
             self.conn.mav.set_gps_global_origin_send(
                 self.conn.target_system,
-                int(28.38 * 1e7), int(77.12 * 1e7), 0
+                origin_lat, origin_lon, 0
             )
             self.conn.mav.set_home_position_send(
                 self.conn.target_system,
-                int(28.38 * 1e7), int(77.12 * 1e7), 0, 0, 0, 0, 0, 0, 0, 0
+                origin_lat, origin_lon, 0,
+                0, 0, 0,
+                [1.0, 0.0, 0.0, 0.0],
+                0, 0, 0
             )
 
             # Ensure we are in GUIDED mode
-            self.set_mode("GUIDED")
-            import time
-            time.sleep(0.5)
+            current_mode = str(snapshot.get("mode") or "UNKNOWN").upper()
+            if current_mode != "GUIDED":
+                mode_ok, mode_msg = self.set_mode("GUIDED")
+                if not mode_ok:
+                    return False, f"Takeoff aborted: {mode_msg}"
+                time.sleep(0.5)
 
-            # Set mid throttle on override so it doesn't fail-safe or auto-disarm instantly
-            self.set_rc_override({"1": 1500, "2": 1500, "3": 1500, "4": 1500})
-            
+            takeoff_override = {
+                "1": self.config.RC_NEUTRAL,
+                "2": self.config.RC_NEUTRAL,
+                "3": 0,
+                "4": self.config.RC_NEUTRAL,
+            }
+            ok, msg = self.set_rc_override(takeoff_override)
+            if not ok:
+                return False, msg
+
+            assist_cutoff_alt = max(
+                start_alt + self.config.TAKEOFF_ASSIST_MIN_ALT,
+                float(altitude) * float(self.config.TAKEOFF_ASSIST_TARGET_FRAC),
+            )
+            self._set_takeoff_assist(
+                self.config.RC_TAKEOFF_ASSIST_THROTTLE,
+                self.config.TAKEOFF_ASSIST_SEC,
+                assist_cutoff_alt,
+            )
+
             # Now send TAKEOFF command
             command_id = self.mavutil.mavlink.MAV_CMD_NAV_TAKEOFF
             self.conn.mav.command_long_send(
@@ -659,24 +1238,121 @@ class MAVLinkHandler:
                 command_id,
                 0, 0, 0, 0, 0, 0, 0, float(altitude)
             )
-            
-            # Snap current position for hover
+
+            # Snap current position and start range-assisted hover guidance.
             st = self.state.get_telem()
-            self.target_x = st.get("viso_x", 0.0)
-            self.target_y = st.get("viso_y", 0.0)
-            
+            self._engage_guidance(st, mode="HOVER", desired_altitude=altitude)
+
             ack = self._wait_for_command_ack(command_id, timeout=3)
             if ack and ack.result == 0:
-                self.target_z = float(altitude)
                 self._update_preflight_status(True, f"Takeoff commanded ({altitude}m)")
-                return True, f"Takeoff commanded to {altitude}m"
+                return True, (
+                    f"Takeoff commanded to {altitude}m; launch assist active at "
+                    f"{self.config.RC_TAKEOFF_ASSIST_THROTTLE} PWM"
+                )
             elif ack:
-                # If traditional takeoff fails, spoof throttle in GUIDED
-                self.target_z = float(altitude)
-                return False, f"Takeoff rejected ({ack.result}), spoofing Z-target"
-            
-            self.target_z = float(altitude)
-            return True, f"Takeoff {altitude}m sent (no ACK)"
+                # Retry once for transient GUIDED/landed-state races.
+                time.sleep(self.config.TAKEOFF_RETRY_SEC)
+                self.conn.mav.command_long_send(
+                    self.conn.target_system,
+                    self.conn.target_component,
+                    command_id,
+                    0, 0, 0, 0, 0, 0, 0, float(altitude)
+                )
+                ack2 = self._wait_for_command_ack(command_id, timeout=3)
+                if ack2 and ack2.result == 0:
+                    self._update_preflight_status(True, f"Takeoff commanded ({altitude}m)")
+                    return True, (
+                        f"Takeoff commanded to {altitude}m on retry; launch assist active at "
+                        f"{self.config.RC_TAKEOFF_ASSIST_THROTTLE} PWM"
+                    )
+                rej = ack2.result if ack2 else ack.result
+                return False, (
+                    f"Takeoff rejected ({rej}); keeping climb assist active and holding Z target at {altitude}m"
+                )
+
+            return True, (
+                f"Takeoff {altitude}m sent (no ACK); climb assist active at "
+                f"{self.config.RC_TAKEOFF_ASSIST_THROTTLE} PWM"
+            )
+        except Exception as e:
+            return False, str(e)
+        finally:
+            self._command_lock.release()
+
+    def hover(self):
+        """Lock current x/y and hold altitude using RealSense range when available."""
+        if not self.connected:
+            return False, "Not connected"
+
+        snapshot = self._read_state()
+        if not snapshot.get("armed"):
+            return False, "Drone must be armed before hover hold"
+
+        try:
+            current_mode = str(snapshot.get("mode") or "UNKNOWN").upper()
+            if current_mode != "GUIDED":
+                ok, msg = self.set_mode("GUIDED")
+                if not ok:
+                    return False, f"Hover aborted: {msg}"
+                time.sleep(0.3)
+                snapshot = self._read_state()
+
+            ok, msg = self.set_rc_override({
+                "1": self.config.RC_NEUTRAL,
+                "2": self.config.RC_NEUTRAL,
+                "3": self.config.RC_ARM_THROTTLE,
+                "4": self.config.RC_NEUTRAL,
+            })
+            if not ok:
+                return False, msg
+
+            hold_altitude = self._engage_guidance(snapshot, mode="HOVER")
+            measured_alt, source = self._measured_altitude(snapshot)
+            source = source or "local_position"
+            self._update_preflight_status(True, f"Hover hold active ({hold_altitude:.2f}m)")
+            return True, (
+                f"Hover hold active at {hold_altitude:.2f}m using {source}; "
+                f"measured altitude {float(measured_alt or hold_altitude):.2f}m"
+            )
+        except Exception as e:
+            return False, str(e)
+
+    def land(self):
+        """Slowly descend in GUIDED while holding x/y using RealSense-assisted altitude correction."""
+        if not self.connected:
+            return False, "Not connected"
+
+        snapshot = self._read_state()
+        if not snapshot.get("armed"):
+            return False, "Drone must be armed before landing"
+
+        try:
+            current_mode = str(snapshot.get("mode") or "UNKNOWN").upper()
+            if current_mode != "GUIDED":
+                ok, msg = self.set_mode("GUIDED")
+                if not ok:
+                    return False, f"Landing aborted: {msg}"
+                time.sleep(0.3)
+                snapshot = self._read_state()
+
+            ok, msg = self.set_rc_override({
+                "1": self.config.RC_NEUTRAL,
+                "2": self.config.RC_NEUTRAL,
+                "3": self.config.RC_ARM_THROTTLE,
+                "4": self.config.RC_NEUTRAL,
+            })
+            if not ok:
+                return False, msg
+
+            start_altitude = self._engage_guidance(snapshot, mode="LAND")
+            measured_alt, source = self._measured_altitude(snapshot)
+            source = source or "local_position"
+            self._update_preflight_status(True, f"Soft landing active ({start_altitude:.2f}m)")
+            return True, (
+                f"Soft landing started from {start_altitude:.2f}m using {source}; "
+                f"descending at {self.config.LAND_DESCENT_RATE:.2f} m/s"
+            )
         except Exception as e:
             return False, str(e)
 
@@ -709,10 +1385,14 @@ class MAVLinkHandler:
             )
             ack = self._wait_for_command_ack(command_id, timeout=3)
             if ack and ack.result == 0:
+                if mode_name != "GUIDED":
+                    self._clear_guidance(clear_position_target=True)
                 self._update_preflight_status(True, f"Mode set to {mode_name}")
                 return True, f"Mode set to {mode_name}"
             elif ack:
                 return False, f"Mode change rejected: result={ack.result}"
+            if mode_name != "GUIDED":
+                self._clear_guidance(clear_position_target=True)
             return True, f"Mode {mode_name} sent (no ACK)"
         except Exception as e:
             return False, str(e)
@@ -753,6 +1433,7 @@ class MAVLinkHandler:
         if not self.connected:
             return False, "Not connected"
         self.active_rc_override = {}
+        self._clear_takeoff_assist()
         try:
             self._send_rc_override_packet({}, release=True)
             return True, "RC override released"
@@ -824,8 +1505,11 @@ class MAVLinkHandler:
                 self.state.update_telem(**updates)
 
         elif t == "BATTERY_STATUS":
+            # Filter garbage cell readings: real LiPo cells are 2.5V-4.2V.
+            # Pixhawk 2.4.8 reports garbage like 190 (0.19V) when power module
+            # isn't properly connected. Threshold at 1V to reject these.
             cells = [v / 1000.0 for v in msg.voltages
-                     if v != 65535 and v != 0 and v > 0]
+                     if v != 65535 and v != 0 and v > 1000]  # > 1000mV = > 1.0V
             u = {}
             if cells:
                 u["cell_voltages"] = cells
@@ -872,6 +1556,25 @@ class MAVLinkHandler:
                 vibe_y=msg.vibration_y,
                 vibe_z=msg.vibration_z,
             )
+
+        elif t == "COMMAND_ACK":
+            # Deposit into thread-safe queue so _wait_for_command_ack (Flask thread) can read it
+            # This prevents the race condition where vision thread eats ACKs meant for command calls
+            try:
+                self._ack_queue.put_nowait(msg)
+            except Exception:
+                pass  # Queue full — discard oldest would be better but rare in practice
+
+        elif t == "STATUSTEXT":
+            text = ""
+            try:
+                text = str(msg.text or "").strip()
+            except Exception:
+                text = ""
+            if text:
+                self.last_status_text = text
+                self.status_text_history.append(text)
+                self.state.update_telem(preflight_message=text)
 
     _process = _process_message
 
@@ -949,7 +1652,7 @@ class VisionEngine:
         self.pipeline = pipeline
         self.depth_scale = profile.get_device().first_depth_sensor().get_depth_scale()
 
-        # Try high-accuracy preset
+        # Try high-accuracy preset (may fail on some platforms — non-fatal)
         try:
             profile.get_device().first_depth_sensor().set_option(
                 rs.option.visual_preset, 3
@@ -1085,20 +1788,7 @@ class VisionEngine:
                                 method = "SPARSE"
                                 n_feat = len(good_next)
 
-                            # Update tracked points
-                            if len(good_next) < self.config.MIN_FEAT:
-                                self.prev_points = cv2.goodFeaturesToTrack(
-                                    gray, **self.feat_params
-                                )
-                                if self.prev_points is not None:
-                                    cv2.cornerSubPix(
-                                        gray, self.prev_points, (5, 5), (-1, -1),
-                                        (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
-                                    )
-                            else:
-                                self.prev_points = good_next.reshape(-1, 1, 2)
-
-                # --- Dense Farneback fallback ---
+                # --- Dense Farneback FALLBACK (only if sparse failed AND enabled) ---
                 if not sparse_ok and self.config.DENSE_FALLBACK:
                     flow = cv2.calcOpticalFlowFarneback(
                         self.prev_gray, gray, None,
@@ -1144,11 +1834,32 @@ class VisionEngine:
             vel_n *= scale
             vel_e *= scale
 
+        # Reject low-altitude/noise updates that commonly cause horizontal drift.
+        if self.altitude < self.config.FLOW_MIN_VALID_ALT:
+            vel_n = 0.0
+            vel_e = 0.0
+            if method in ("SPARSE", "DENSE"):
+                method = "IDLE"
+
+        # Deadband tiny residual velocities from camera noise/vibration.
+        if abs(vel_n) < self.config.FLOW_DEADBAND_MPS:
+            vel_n = 0.0
+        if abs(vel_e) < self.config.FLOW_DEADBAND_MPS:
+            vel_e = 0.0
+
         # ---- KALMAN FILTER ----
         if dt > 0:
             self.kalman.predict(dt)
             if method in ("SPARSE", "DENSE"):
                 self.kalman.update(vel_n, vel_e)
+            else:
+                self.kalman.x[2] *= self.config.VEL_DAMP_IDLE
+                self.kalman.x[3] *= self.config.VEL_DAMP_IDLE
+
+            if abs(self.kalman.x[2]) < (self.config.FLOW_DEADBAND_MPS * 0.5):
+                self.kalman.x[2] = 0.0
+            if abs(self.kalman.x[3]) < (self.config.FLOW_DEADBAND_MPS * 0.5):
+                self.kalman.x[3] = 0.0
 
         kx = float(self.kalman.x[0])
         ky = float(self.kalman.x[1])
@@ -1157,7 +1868,7 @@ class VisionEngine:
 
         # ---- SEND TO PIXHAWK ----
         self.mav.send_vision_position(kx, ky, -self.altitude)
-        self.mav.send_vision_speed(kvx, kvy, 0.0) # Z velocity (down) is hard to compute, keeping to 0 or derive from depth derivative
+        self.mav.send_vision_speed(kvx, kvy, 0.0)
         if self.altitude > 0:
             self.mav.send_distance(int(self.altitude * 100))
         self.mav.send_heartbeat()
@@ -1191,18 +1902,27 @@ class VisionEngine:
             self.last_web_frame = now
 
             # Color feed with HUD
+            # pyrealsense2 pip package sometimes doesn't deliver color frames
+            # Fall back to colorized IR if color is unavailable
+            color_img = None
             if color_frame:
                 color_img = np.asanyarray(color_frame.get_data())
+            elif gray is not None:
+                # Fallback: convert grayscale IR to BGR so HUD renders properly
+                color_img = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+            if color_img is not None:
                 self._draw_color_hud(color_img, kx, ky, kvx, kvy, method, fq)
                 _, jpeg = cv2.imencode(
                     ".jpg", color_img,
                     [cv2.IMWRITE_JPEG_QUALITY, self.config.JPEG_QUALITY]
                 )
+                src = "d435i-color" if color_frame else "d435i-ir-fallback"
                 self.state.set_color_frame(
                     jpeg.tobytes(),
                     width=color_img.shape[1],
                     height=color_img.shape[0],
-                    source="d435i-color",
+                    source=src,
                 )
 
             # Optical flow visualization
@@ -1487,7 +2207,8 @@ pre{background:#16181c;padding:12px;border-radius:4px;font-size:11px;overflow-x:
 <button class="btn mode" onclick="cmd('/api/mode/ALT_HOLD')">ALT_HOLD</button>
 <button class="btn mode" onclick="cmd('/api/mode/LOITER')">LOITER</button>
 <button class="btn mode" onclick="cmd('/api/mode/POSHOLD')">POSHOLD</button>
-<button class="btn mode" onclick="cmd('/api/mode/LAND')">LAND</button>
+<button class="btn mode" onclick="cmd('/api/hover')">HOVER HOLD</button>
+<button class="btn mode" onclick="cmd('/api/land')">SOFT LAND</button>
 <button class="btn mode" onclick="cmd('/api/mode/RTL')">RTL</button>
 <button class="btn mode" onclick="cmd('/api/mode/GUIDED')">GUIDED</button>
 <br>
@@ -1506,9 +2227,9 @@ async function cmd(url){
     const d=await r.json();
     const log=document.getElementById('log');
     const ts=new Date().toLocaleTimeString();
-    log.innerHTML=`<div>[${ts}] ${url} → ${d.ok?'OK':'FAIL'}: ${d.msg}</div>`+log.innerHTML;
+    log.innerHTML='<div>['+ts+'] '+url+' -> '+(d.ok?'OK':'FAIL')+': '+d.msg+'</div>'+log.innerHTML;
   }catch(e){
-    document.getElementById('log').innerHTML=`<div style="color:#dc2626">Error: ${e}</div>`+document.getElementById('log').innerHTML;
+    document.getElementById('log').innerHTML='<div style="color:#dc2626">Error: '+e+'</div>'+document.getElementById('log').innerHTML;
   }
 }
 async function forceCmd(url){
@@ -1519,9 +2240,9 @@ async function forceCmd(url){
     const d=await r.json();
     const log=document.getElementById('log');
     const ts=new Date().toLocaleTimeString();
-    log.innerHTML=`<div>[${ts}] ${url} -> ${d.ok?'OK':'FAIL'}: ${d.msg}</div>`+log.innerHTML;
+    log.innerHTML='<div>['+ts+'] '+url+' -> '+(d.ok?'OK':'FAIL')+': '+d.msg+'</div>'+log.innerHTML;
   }catch(e){
-    document.getElementById('log').innerHTML=`<div style="color:#dc2626">Error: ${e}</div>`+document.getElementById('log').innerHTML;
+    document.getElementById('log').innerHTML='<div style="color:#dc2626">Error: '+e+'</div>'+document.getElementById('log').innerHTML;
   }
 }
 setInterval(async()=>{
@@ -1533,7 +2254,7 @@ setInterval(async()=>{
     const important=['armed','mode','alt_rel','pos_x','pos_y','vx','vy','vz',
                      'bat_voltage','bat_soc','bat_current','flow_method','flow_quality',
                      'vision_fps','ekf_ok','d435i_ok','pixhawk_ok','preflight_message','heading','throttle',
-                     'roll','pitch','yaw','rangefinder_dist','vibe_x','vibe_y','vibe_z'];
+                     'roll','pitch','yaw','rangefinder_dist','guidance_mode','guidance_target_alt','vibe_x','vibe_y','vibe_z'];
     for(const k of important){
       let v=d[k];
       if(typeof v==='number')v=v.toFixed(3);
@@ -1541,7 +2262,7 @@ setInterval(async()=>{
       if(k==='armed')c=v==='true'||v===true?'#10b981':'#dc2626';
       if(k==='mode')c='#60a5fa';
       if(k==='bat_soc')c=parseFloat(v)>50?'#10b981':parseFloat(v)>25?'#eab308':'#dc2626';
-      s+=`<span style="color:${c}">${k}: ${v}</span>  `;
+      s+='<span style="color:'+c+'">'+k+': '+v+'</span>  ';
     }
     el.innerHTML=s;
   }catch{}
@@ -1592,9 +2313,10 @@ def api_disarm():
 def api_force_disarm():
     data = request.get_json(silent=True) or {}
     confirm = data.get("confirm") or request.args.get("confirm", "")
-    if confirm != "FORCE":
+    # Accept: {"confirm": true}, {"confirm": "FORCE"}, ?confirm=FORCE
+    if confirm not in (True, "true", "FORCE", "force"):
         return _json_response(
-            {"ok": False, "msg": "Confirmation required: send {'confirm': 'FORCE'}"},
+            {"ok": False, "msg": "Confirmation required: send {'confirm': true}"},
             status=400,
         )
     if mav_handler:
@@ -1611,6 +2333,53 @@ def api_takeoff():
         ok, msg = mav_handler.takeoff(altitude)
         return _json_response({"ok": ok, "msg": msg})
     return _json_response({"ok": False, "msg": "No MAVLink connection"})
+
+
+@app.route("/api/hover", methods=["POST"])
+def api_hover():
+    if mav_handler:
+        ok, msg = mav_handler.hover()
+        return _json_response({"ok": ok, "msg": msg})
+    return _json_response({"ok": False, "msg": "No MAVLink connection"})
+
+
+@app.route("/api/land", methods=["POST"])
+def api_land():
+    if mav_handler:
+        ok, msg = mav_handler.land()
+        return _json_response({"ok": ok, "msg": msg})
+    return _json_response({"ok": False, "msg": "No MAVLink connection"})
+
+
+@app.route("/api/arm_and_takeoff", methods=["POST"])
+def api_arm_and_takeoff():
+    """One-click ARM → GUIDED → TAKEOFF sequence.
+    This is the correct sequence for companion-computer controlled flight.
+    Doing these as separate button clicks causes the drone to disarm between steps."""
+    if not mav_handler:
+        return _json_response({"ok": False, "msg": "No MAVLink connection"})
+
+    data = request.get_json(silent=True) or {}
+    altitude = data.get("altitude", 4.0)
+    steps = []
+
+    # Step 1: ARM (this also sends RC override)
+    ok, msg = mav_handler.arm()
+    steps.append(f"ARM: {msg}")
+    if not ok:
+        return _json_response({"ok": False, "msg": " → ".join(steps)})
+
+    # Step 2: TAKEOFF (internally sets GUIDED + sends takeoff command)
+    deadline = time.time() + 1.5
+    while time.time() < deadline:
+        snap = mav_handler._read_state()
+        if snap.get("armed"):
+            break
+        time.sleep(0.1)
+    ok, msg = mav_handler.takeoff(altitude)
+    steps.append(f"TAKEOFF: {msg}")
+
+    return _json_response({"ok": ok, "msg": " → ".join(steps)})
 
 
 @app.route("/api/mode/<mode_name>", methods=["POST"])
@@ -1641,12 +2410,30 @@ def api_rc_release():
 
 def _mjpeg_stream(frame_getter):
     """Generate MJPEG stream from a frame getter function."""
+    # Generate a 1x1 black JPEG as placeholder so the stream doesn't hang
+    _placeholder = None
     while True:
         frame = frame_getter()
         if frame is not None:
             yield (b"--frame\r\n"
                    b"Content-Type: image/jpeg\r\n\r\n" +
                    frame + b"\r\n")
+        else:
+            # Send a tiny placeholder so the MJPEG stream stays alive
+            # and the browser doesn't timeout waiting for first frame
+            if _placeholder is None:
+                try:
+                    import numpy as np
+                    black = np.zeros((120, 160, 3), dtype=np.uint8)
+                    cv2.putText(black, "NO FEED", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (80, 80, 80), 1)
+                    _, _placeholder = cv2.imencode(".jpg", black)
+                    _placeholder = _placeholder.tobytes()
+                except Exception:
+                    _placeholder = b""
+            if _placeholder:
+                yield (b"--frame\r\n"
+                       b"Content-Type: image/jpeg\r\n\r\n" +
+                       _placeholder + b"\r\n")
         time.sleep(1.0 / Config.WEB_FEED_FPS)
 
 
@@ -1681,7 +2468,7 @@ def main():
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--demo", action="store_true", help="Run with simulated data")
     parser.add_argument("--dense-fallback", action="store_true",
-                        help="Enable dense Farneback fallback only when sparse flow fails")
+                        help="Enable dense optical flow as fallback when sparse fails")
     parser.add_argument("--allow-auto-mode", action="store_true",
                         help="Allow AUTO mode changes from the web API")
     parser.add_argument("--allow-unsafe-modes", action="store_true",
@@ -1727,6 +2514,31 @@ def main():
             target=demo_thread, args=(state, stop_event), daemon=True
         ).start()
     else:
+        # Print required ArduPilot parameters (verified from official docs)
+        print("  ┌─── REQUIRED PIXHAWK PARAMETERS (GNSS-denied) ───────────────┐")
+        print("  │ Set these in Mission Planner BEFORE flight:                  │")
+        print("  │                                                              │")
+        print("  │  AHRS_EKF_TYPE  = 3        (use EKF3)                       │")
+        print("  │  EK3_ENABLE     = 1        (enable EKF3)                    │")
+        print("  │  EK3_SRC1_POSXY = 6        (ExternalNav)                    │")
+        print("  │  EK3_SRC1_VELXY = 6        (ExternalNav)                    │")
+        print("  │  EK3_SRC1_POSZ  = 6        (ExternalNav)                    │")
+        print("  │  EK3_SRC1_VELZ  = 6        (ExternalNav)                    │")
+        print("  │  EK3_SRC1_YAW   = 1        (Compass)                        │")
+        print("  │  EK3_SRC_OPTIONS= 0        (no fuse-all)                    │")
+        print("  │  VISO_TYPE      = 0        (Disabled for VISION_POSITION)   │")
+        print("  │  GPS_TYPE       = 0        (disable GPS)                    │")
+        print("  │  ARMING_CHECK   = -5       (skip GPS check, keep others)    │")
+        print("  │  FS_THR_ENABLE  = 0        (disable RC throttle failsafe)   │")
+        print("  │  FS_GCS_ENABLE  = 0        (disable GCS failsafe)           │")
+        print("  │  BRD_SAFETY_DEFLT = 0      (disable safety switch)          │")
+        print("  │                                                              │")
+        print("  │  Source: ardupilot.org/dev/docs/mavlink-nongps-position-     │")
+        print("  │  estimation.html + ardupilot.org/copter/docs/common-ekf-    │")
+        print("  │  sources.html                                               │")
+        print("  └──────────────────────────────────────────────────────────────┘")
+        print()
+
         # Connect to Pixhawk
         mav_handler = MAVLinkHandler(config, state)
         if not mav_handler.connect():
@@ -1754,6 +2566,7 @@ def main():
     print()
     print("  Controls: ARM, DISARM, MODE buttons on dashboard")
     print("  Web safety: AUTO disabled by default, FORCE DISARM requires confirmation")
+    print(f"  Dense fallback: {'ENABLED' if config.DENSE_FALLBACK else 'DISABLED (use --dense-fallback to enable)'}")
     print("  Press Ctrl+C to stop")
     print()
 
