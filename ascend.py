@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """ hgello
 =============================================================================
-ASCEND GCS — Complete Ground Control + Vision System  [PATCHED]
+ASCEND GCS — Complete Ground Control + Vision System
 =============================================================================
 Windows / Linux compatible. Single script does EVERYTHING:
 
@@ -34,23 +34,6 @@ Flow feed:  http://localhost:5000/feed/flow
 =============================================================================
 Team Saarabai X — IRoC-U 2026 — Bennett University
 =============================================================================
-
-PATCH NOTES (critical fixes):
-  - FIX #1: IMU rotation compensation — subtract body roll/pitch rates from
-            optical flow to prevent tilt-induced drift (PRIMARY drift source)
-  - FIX #2: Don't double-feed EKF — send ONLY position OR speed, not both
-            (was causing EKF to amplify drift by fusing correlated data twice)
-  - FIX #3: Kalman tuning — raise Q, raise R → trust measurements less,
-            smooth more aggressively
-  - FIX #4: VEL_DAMP_IDLE 0.85 → 0.40 — velocity must decay FAST when idle
-  - FIX #5: FLOW_DEADBAND 0.04 → 0.08 — reject vibration-induced micro-velocities
-  - FIX #6: OUTLIER_MAD 2.5 → 1.8 — tighter outlier rejection on flow vectors
-  - FIX #7: Depth history 5 → 9 — smoother altitude for flow scaling
-  - FIX #8: MIN_FEAT 30 → 50 — reduce feature re-detection thrashing
-  - FIX #9: Position covariance was way too tight (0.005) → loosened to let
-            EKF correct rather than blindly trusting our integrated position
-  - FIX #10: Added flow velocity low-pass filter (EMA) to reject spikes
-  - FIX #11: RC keepalive now sends at 20Hz instead of 12.5Hz for reliability
 """
 
 import numpy as np
@@ -72,7 +55,7 @@ from flask_cors import CORS
 class Config:
     # Connection
     SERIAL_PORT = "COM13" if os.name == "nt" else "/dev/ttyACM0"
-    BAUD_RATE = 57600
+    BAUD_RATE = 57600  # FIX: was 9600, must match argparse default
     WEB_PORT = 5000
 
     # GPS origin for GNSS-denied (Bennett University, Greater Noida)
@@ -90,26 +73,25 @@ class Config:
     FEAT_MAX = 350
     FEAT_QUALITY = 0.015
     FEAT_MIN_DIST = 8
-    MIN_FEAT = 50          # FIX #8: was 30 — too much re-detection thrashing
+    MIN_FEAT = 30
     MIN_FLOW = 15
     DENSE_FALLBACK = False
-    OUTLIER_MAD = 1.8      # FIX #6: was 2.5 — tighter outlier rejection
-    MAX_VEL = 3.0          # FIX: was 5.0 — real indoor drone won't exceed 3 m/s
-    FLOW_DEADBAND_MPS = 0.08  # FIX #5: was 0.04 — reject vibration noise
+    OUTLIER_MAD = 2.5
+    MAX_VEL = 5.0
+    FLOW_DEADBAND_MPS = 0.04
     FLOW_MIN_VALID_ALT = 0.25
-    VEL_DAMP_IDLE = 0.40   # FIX #4: was 0.85 — MUST decay fast when no flow
-    FLOW_EMA_ALPHA = 0.35  # FIX #10: low-pass filter on velocity (0=full smooth, 1=no smooth)
+    VEL_DAMP_IDLE = 0.85
 
     # Depth
     DEPTH_ROI_PCT = 15
     DEPTH_MIN = 0.1
     DEPTH_MAX = 10.0
-    DEPTH_HIST = 9         # FIX #7: was 5 — smoother altitude for flow scaling
-    DEPTH_MAX_JUMP = 1.5   # FIX: was 2.0 — reject smaller jumps
+    DEPTH_HIST = 5
+    DEPTH_MAX_JUMP = 2.0
 
-    # Kalman — FIX #3: was Q=0.001, R=0.01 → trusting noisy flow too much
-    KF_Q = 0.01            # Process noise: how fast we expect true velocity to change
-    KF_R = 0.08            # Measurement noise: how noisy our flow measurements are
+    # Kalman
+    KF_Q = 0.001
+    KF_R = 0.01
 
     # Camera yaw (degrees, 0 = USB connector forward)
     CAM_YAW = 0
@@ -326,6 +308,7 @@ class MAVLinkHandler:
         18: "THROW", 21: "SMART_RTL",
     }
 
+    # Reverse map for setting modes
     MODE_NAME_TO_NUM = {v: k for k, v in MODE_MAP.items()}
     POSITION_MODES = {"LOITER", "POSHOLD", "GUIDED", "AUTO", "BRAKE", "RTL"}
     SAFE_ARM_MODES = {"STABILIZE", "ALT_HOLD", "LOITER", "POSHOLD", "BRAKE", "LAND", "GUIDED"}
@@ -340,7 +323,7 @@ class MAVLinkHandler:
         self.last_hb_send = 0
         self.last_rc_target_send = 0
         self.connected = False
-        self.target_z = None
+        self.target_z = None  # None or altitude in meters (> 0 = UP)
         self.target_x = 0.0
         self.target_y = 0.0
         self.active_rc_override = {}
@@ -361,9 +344,11 @@ class MAVLinkHandler:
         self.status_text_history = collections.deque(maxlen=30)
         self._command_lock = threading.Lock()
         self.last_takeoff_request = 0.0
+        # Thread-safe ACK queue: vision thread deposits ACKs, command thread reads them
+        # This prevents the race condition where recv_match in two threads eats each other's messages
         import queue
         self._ack_queue = queue.Queue(maxsize=32)
-        self._mav_lock = threading.Lock()
+        self._mav_lock = threading.Lock()  # Guards serial read/write
 
     def _set_param(self, name, value, param_type=None):
         if not self.connected:
@@ -396,6 +381,7 @@ class MAVLinkHandler:
         }
         self.active_rc_override = dict(base_override)
 
+        # Push immediate RC packet before background loop starts.
         try:
             self._send_rc_override_packet(self._effective_rc_override())
         except Exception:
@@ -416,8 +402,7 @@ class MAVLinkHandler:
                         self._send_rc_override_packet(rc_override)
                 except Exception:
                     pass
-                # FIX #11: 20Hz instead of 12.5Hz for RC keepalive reliability
-                time.sleep(0.05)
+                time.sleep(0.08)
 
         self._rc_keepalive_thread = threading.Thread(
             target=_loop,
@@ -490,6 +475,9 @@ class MAVLinkHandler:
         return True
 
     def _patch_pymavlink_add_message(self, mavutil_module):
+        """Patch pymavlink's add_message cache helper to tolerate None _instances.
+        Some pymavlink builds raise TypeError during wait_heartbeat on Windows when
+        instance-cached messages arrive before _instances is initialized."""
         original_add_message = getattr(mavutil_module, "add_message", None)
         if original_add_message is None:
             return
@@ -502,6 +490,7 @@ class MAVLinkHandler:
             except TypeError as exc:
                 if "NoneType" not in str(exc):
                     raise
+
                 existing = messages.get(mtype)
                 if existing is not None and hasattr(existing, "_instances"):
                     if existing._instances is None:
@@ -511,6 +500,7 @@ class MAVLinkHandler:
                         instance_value = getattr(msg, instance_field)
                         existing._instances[instance_value] = msg
                         return
+
                 messages[mtype] = msg
 
         mavutil_module.add_message = _safe_add_message
@@ -565,11 +555,13 @@ class MAVLinkHandler:
             preflight_message="Connected to Pixhawk; waiting for live telemetry",
         )
 
+        # Request data streams
         self.conn.mav.request_data_stream_send(
             self.conn.target_system, self.conn.target_component,
             self.mavutil.mavlink.MAV_DATA_STREAM_ALL, 10, 1
         )
 
+        # Request specific higher-rate messages
         for msg_id, rate in [
             (self.mavutil.mavlink.MAVLINK_MSG_ID_LOCAL_POSITION_NED, 15),
             (self.mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE, 15),
@@ -588,6 +580,8 @@ class MAVLinkHandler:
             except Exception:
                 pass
 
+        # CRITICAL for GNSS-denied: Set GPS origin + home IMMEDIATELY so EKF can converge.
+        # Without this, EKF stays unhappy → positioning_ready fails → can't enter GUIDED.
         origin_lat = int(self.config.ORIGIN_LAT * 1e7)
         origin_lon = int(self.config.ORIGIN_LON * 1e7)
         try:
@@ -607,6 +601,7 @@ class MAVLinkHandler:
         except Exception as e:
             print(f"[MAVLink] WARNING: Could not set GPS origin: {e}")
 
+        # Send first heartbeat immediately (don't wait for 1Hz loop)
         try:
             self.conn.mav.heartbeat_send(
                 self.mavutil.mavlink.MAV_TYPE_ONBOARD_CONTROLLER,
@@ -626,6 +621,8 @@ class MAVLinkHandler:
         return getter()
 
     def _wait_for_command_ack(self, command_id, timeout=3):
+        """Wait for COMMAND_ACK from the ACK queue (populated by vision thread's _process_message).
+        This avoids the race condition where two threads call recv_match on the same connection."""
         import queue as _queue
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -635,6 +632,7 @@ class MAVLinkHandler:
                 ack_command = getattr(ack, "command", None)
                 if ack_command in (None, command_id):
                     return ack
+                # Not our ACK — discard and keep waiting
             except _queue.Empty:
                 return None
         return None
@@ -857,14 +855,13 @@ class MAVLinkHandler:
         if not self.connected:
             return
         ts = int((time.time() - self.boot_time) * 1e6)
-        # FIX #9: Loosened position covariance — was 0.005 which tells EKF to
-        # blindly trust our integrated position. 0.05-0.1 lets EKF correct us.
-        cov = [0.08, 0, 0, 0, 0, 0,
-               0.08, 0, 0, 0, 0,
-               0.05, 0, 0, 0,
-               0.05, 0, 0,
-               0.05, 0,
-               0.1]
+        # Tight covariance for position: trusting our optical flow deeply
+        cov = [0.005, 0, 0, 0, 0, 0,
+               0.005, 0, 0, 0, 0,
+               0.01,  0, 0, 0,
+               0.01,  0, 0,
+               0.01,  0,
+               0.02]
         try:
             self.conn.mav.vision_position_estimate_send(
                 ts, float(x), float(y), float(z),
@@ -876,15 +873,14 @@ class MAVLinkHandler:
                 print(f"[MAV-TX] vision_position error: {e}")
 
     def send_vision_speed(self, vx, vy, vz):
-        """Send velocity estimate to Pixhawk.
-        FIX #2: This is now the PRIMARY velocity source. We no longer double-feed
-        both position and speed — see process_frame() for the change."""
         if not self.connected:
             return
         ts = int((time.time() - self.boot_time) * 1e6)
-        cov = [0.02, 0.0,  0.0,
-               0.0,  0.02, 0.0,
-               0.0,  0.0,  0.05]
+        # FIX: covariance is row-major 3x3 = 9 floats
+        # Diagonal = variance of vx, vy, vz; off-diagonal = 0
+        cov = [0.005, 0.0,   0.0,
+               0.0,   0.005, 0.0,
+               0.0,   0.0,   0.02]
         try:
             self.conn.mav.vision_speed_estimate_send(
                 ts, float(vx), float(vy), float(vz),
@@ -915,9 +911,12 @@ class MAVLinkHandler:
         now = time.time()
         self._update_guidance_target()
 
-        # FIX #11: 20Hz periodic RC override + position target
-        if now - getattr(self, "last_rc_target_send", 0) > 0.05:
+        # 12.5Hz periodic RC override + position target
+        # MUST be fast enough that Pixhawk never sees a gap (RC_OVERRIDE_TIME default = 3s,
+        # but some firmwares have shorter timeouts). 12.5Hz gives plenty of margin.
+        if now - getattr(self, "last_rc_target_send", 0) > 0.08:
             self.last_rc_target_send = now
+            # Send continuous RC override if active
             rc_override = self._effective_rc_override()
             if rc_override:
                 try:
@@ -925,6 +924,7 @@ class MAVLinkHandler:
                 except Exception:
                     pass
 
+            # Send continuous position target if active
             if getattr(self, "target_z", None) is not None:
                 try:
                     self.conn.mav.set_position_target_local_ned_send(
@@ -952,6 +952,7 @@ class MAVLinkHandler:
     # ---- COMMANDS ----
 
     def arm(self):
+        """Arm with robust GNSS-denied sequencing and RC keepalive protection."""
         if not self.connected:
             return False, "Not connected"
         if not self._command_lock.acquire(blocking=False):
@@ -967,6 +968,7 @@ class MAVLinkHandler:
             self._command_lock.release()
             return True, msg
         try:
+            # Ensure GUIDED before arm, with retries and explicit verification.
             guided_ok = False
             for _ in range(3):
                 snapshot = self._read_state()
@@ -987,12 +989,15 @@ class MAVLinkHandler:
             if not ekf_ok:
                 return False, ekf_msg
 
+            # Best-effort failsafe tuning for no-RC companion-driven arming.
             self._set_param("FS_THR_ENABLE", 0)
             self._set_param("DISARM_DELAY", 30)
 
+            # Keep throttle at absolute minimum for arm checks, then raise after arming.
             self._start_rc_keepalive(self.config.RC_MIN)
             time.sleep(0.4)
 
+            # Drain any stale ACKs from the queue
             import queue as _queue
             while True:
                 try:
@@ -1006,7 +1011,14 @@ class MAVLinkHandler:
                     self.conn.target_system,
                     self.conn.target_component,
                     command_id,
-                    0, 1, 0, 0, 0, 0, 0, 0,
+                    0,
+                    1,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
                 )
                 ack = self._wait_for_command_ack(command_id, timeout=4)
                 if ack and ack.result == 0:
@@ -1015,11 +1027,14 @@ class MAVLinkHandler:
                     return True, "Armed successfully; RC keepalive active"
                 time.sleep(0.25)
 
+            # Common no-SD-card case on Pixhawk 2.4.8: "Arm: Logging failed".
+            # Apply a one-shot fallback and retry arm once.
             if self._recent_status_contains("logging failed"):
                 self._set_param("LOG_BACKEND_TYPE", 0)
                 self._set_param("ARMING_CHECK", 0)
                 time.sleep(0.3)
 
+                import queue as _queue
                 while True:
                     try:
                         self._ack_queue.get_nowait()
@@ -1030,7 +1045,14 @@ class MAVLinkHandler:
                     self.conn.target_system,
                     self.conn.target_component,
                     command_id,
-                    0, 1, 0, 0, 0, 0, 0, 0,
+                    0,
+                    1,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
                 )
                 ack = self._wait_for_command_ack(command_id, timeout=4)
                 if ack and ack.result == 0:
@@ -1038,6 +1060,7 @@ class MAVLinkHandler:
                     self._update_preflight_status(True, "Armed")
                     return True, "Armed successfully; logging check bypass applied"
 
+            # ACK fallback: verify armed state from heartbeat.
             time.sleep(0.5)
             snapshot = self._read_state()
             if snapshot.get("armed"):
@@ -1060,9 +1083,11 @@ class MAVLinkHandler:
             self._command_lock.release()
 
     def disarm(self):
+        """Disarm the drone."""
         if not self.connected:
             return False, "Not connected"
         try:
+            # Drain stale ACKs
             import queue as _queue
             while True:
                 try:
@@ -1075,7 +1100,10 @@ class MAVLinkHandler:
                 self.conn.target_system,
                 self.conn.target_component,
                 command_id,
-                0, 0, 0, 0, 0, 0, 0, 0
+                0,      # confirmation
+                0,      # param1: 0 = disarm
+                0,      # param2: 0 = normal, 21196 = force
+                0, 0, 0, 0, 0
             )
             ack = self._wait_for_command_ack(command_id, timeout=3)
             if ack and ack.result == 0:
@@ -1092,6 +1120,7 @@ class MAVLinkHandler:
             return False, str(e)
 
     def force_disarm(self):
+        """Force disarm (emergency). param2=21196 bypasses checks."""
         if not self.connected:
             return False, "Not connected"
         try:
@@ -1112,6 +1141,7 @@ class MAVLinkHandler:
             return False, str(e)
 
     def takeoff(self, altitude=4.0):
+        """Takeoff to specified altitude in meters."""
         if not self.connected:
             return False, "Not connected"
         if not self._command_lock.acquire(blocking=False):
@@ -1125,6 +1155,7 @@ class MAVLinkHandler:
 
             snapshot = self._read_state()
             if not snapshot.get("armed"):
+                # Arm state can lag a heartbeat tick right after /api/arm success.
                 deadline = time.time() + 1.2
                 while time.time() < deadline:
                     snapshot = self._read_state()
@@ -1134,6 +1165,7 @@ class MAVLinkHandler:
                 if not snapshot.get("armed"):
                     return False, "Drone must be armed before takeoff"
 
+            # If a takeoff/hover target for this altitude is already active, avoid re-sending command spam.
             if self.guidance_mode == "HOVER" and self.guidance_target_altitude is not None:
                 if abs(float(self.guidance_target_altitude) - altitude) <= 0.25:
                     return True, f"Takeoff already active at {self.guidance_target_altitude:.2f}m"
@@ -1141,6 +1173,7 @@ class MAVLinkHandler:
             measured_alt, _ = self._measured_altitude(snapshot)
             start_alt = float(measured_alt if measured_alt is not None else (snapshot.get("alt_rel") or 0.0))
 
+            # Force origin again just to be safe
             origin_lat = int(self.config.ORIGIN_LAT * 1e7)
             origin_lon = int(self.config.ORIGIN_LON * 1e7)
             self.conn.mav.set_gps_global_origin_send(
@@ -1155,6 +1188,7 @@ class MAVLinkHandler:
                 0, 0, 0
             )
 
+            # Ensure we are in GUIDED mode
             current_mode = str(snapshot.get("mode") or "UNKNOWN").upper()
             if current_mode != "GUIDED":
                 mode_ok, mode_msg = self.set_mode("GUIDED")
@@ -1182,6 +1216,7 @@ class MAVLinkHandler:
                 assist_cutoff_alt,
             )
 
+            # Now send TAKEOFF command
             command_id = self.mavutil.mavlink.MAV_CMD_NAV_TAKEOFF
             self.conn.mav.command_long_send(
                 self.conn.target_system,
@@ -1190,6 +1225,7 @@ class MAVLinkHandler:
                 0, 0, 0, 0, 0, 0, 0, float(altitude)
             )
 
+            # Snap current position and start range-assisted hover guidance.
             st = self.state.get_telem()
             self._engage_guidance(st, mode="HOVER", desired_altitude=altitude)
 
@@ -1201,6 +1237,7 @@ class MAVLinkHandler:
                     f"{self.config.RC_TAKEOFF_ASSIST_THROTTLE} PWM"
                 )
             elif ack:
+                # Retry once for transient GUIDED/landed-state races.
                 time.sleep(self.config.TAKEOFF_RETRY_SEC)
                 self.conn.mav.command_long_send(
                     self.conn.target_system,
@@ -1230,6 +1267,7 @@ class MAVLinkHandler:
             self._command_lock.release()
 
     def hover(self):
+        """Lock current x/y and hold altitude using RealSense range when available."""
         if not self.connected:
             return False, "Not connected"
 
@@ -1267,6 +1305,7 @@ class MAVLinkHandler:
             return False, str(e)
 
     def land(self):
+        """Slowly descend in GUIDED while holding x/y using RealSense-assisted altitude correction."""
         if not self.connected:
             return False, "Not connected"
 
@@ -1304,6 +1343,7 @@ class MAVLinkHandler:
             return False, str(e)
 
     def set_mode(self, mode_name):
+        """Set flight mode by name (STABILIZE, LOITER, AUTO, etc)."""
         if not self.connected:
             return False, "Not connected"
 
@@ -1315,6 +1355,7 @@ class MAVLinkHandler:
         mode_num = self.MODE_NAME_TO_NUM.get(mode_name)
 
         if mode_num is None:
+            # Try mode_mapping from pymavlink
             mapping = self.conn.mode_mapping() or {}
             if mode_name in mapping:
                 mode_num = mapping[mode_name]
@@ -1343,6 +1384,11 @@ class MAVLinkHandler:
             return False, str(e)
 
     def set_rc_override(self, channels):
+        """
+        Override RC channels. channels = dict of {channel_num: pwm_value}
+        Channel numbers are 1-indexed (1=roll, 2=pitch, 3=throttle, 4=yaw).
+        Use 0 or 65535 to release a channel back to RC transmitter.
+        """
         if not self.connected:
             return False, "Not connected"
         snapshot = self._read_state()
@@ -1369,6 +1415,7 @@ class MAVLinkHandler:
             return False, str(e)
 
     def release_rc_override(self):
+        """Release all RC channel overrides."""
         if not self.connected:
             return False, "Not connected"
         self.active_rc_override = {}
@@ -1444,8 +1491,11 @@ class MAVLinkHandler:
                 self.state.update_telem(**updates)
 
         elif t == "BATTERY_STATUS":
+            # Filter garbage cell readings: real LiPo cells are 2.5V-4.2V.
+            # Pixhawk 2.4.8 reports garbage like 190 (0.19V) when power module
+            # isn't properly connected. Threshold at 1V to reject these.
             cells = [v / 1000.0 for v in msg.voltages
-                     if v != 65535 and v != 0 and v > 1000]
+                     if v != 65535 and v != 0 and v > 1000]  # > 1000mV = > 1.0V
             u = {}
             if cells:
                 u["cell_voltages"] = cells
@@ -1494,10 +1544,12 @@ class MAVLinkHandler:
             )
 
         elif t == "COMMAND_ACK":
+            # Deposit into thread-safe queue so _wait_for_command_ack (Flask thread) can read it
+            # This prevents the race condition where vision thread eats ACKs meant for command calls
             try:
                 self._ack_queue.put_nowait(msg)
             except Exception:
-                pass
+                pass  # Queue full — discard oldest would be better but rare in practice
 
         elif t == "STATUSTEXT":
             text = ""
@@ -1533,6 +1585,8 @@ class VisionEngine:
         self.fx = 1.0
         self.fy = 1.0
         self.pipeline = None
+        self.color_enabled = True
+        self.use_ir_stream = True
         self.roi = (0, 0, 0, 0)
 
         yaw = np.radians(config.CAM_YAW)
@@ -1558,37 +1612,67 @@ class VisionEngine:
         self.current_fps = 0.0
         self.last_web_frame = 0.0
 
-        # FIX #10: EMA velocity state for low-pass filtering
-        self.ema_vel_n = 0.0
-        self.ema_vel_e = 0.0
-
     def start(self):
         import pyrealsense2 as rs
         self.rs = rs
 
-        pipeline = rs.pipeline()
-        rs_cfg = rs.config()
+        profile = None
+        attempt_profiles = [
+            # (use_ir, use_color, fps)
+            (True, True, self.config.FPS),
+            (True, True, 30),
+            (True, False, 30),
+            (False, True, 30),
+            (False, True, 15),
+        ]
 
-        rs_cfg.enable_stream(
-            rs.stream.infrared, 1,
-            self.config.WIDTH, self.config.HEIGHT,
-            rs.format.y8, self.config.FPS
-        )
-        rs_cfg.enable_stream(
-            rs.stream.color,
-            self.config.WIDTH, self.config.HEIGHT,
-            rs.format.bgr8, self.config.FPS
-        )
-        rs_cfg.enable_stream(
-            rs.stream.depth,
-            self.config.WIDTH, self.config.HEIGHT,
-            rs.format.z16, self.config.FPS
-        )
+        for use_ir, use_color, fps in attempt_profiles:
+            pipeline = rs.pipeline()
+            rs_cfg = rs.config()
+            try:
+                if use_ir:
+                    rs_cfg.enable_stream(
+                        rs.stream.infrared,
+                        1,
+                        self.config.WIDTH,
+                        self.config.HEIGHT,
+                        rs.format.y8,
+                        int(fps),
+                    )
+                if use_color:
+                    rs_cfg.enable_stream(
+                        rs.stream.color,
+                        self.config.WIDTH,
+                        self.config.HEIGHT,
+                        rs.format.bgr8,
+                        int(fps),
+                    )
+                rs_cfg.enable_stream(
+                    rs.stream.depth,
+                    self.config.WIDTH,
+                    self.config.HEIGHT,
+                    rs.format.z16,
+                    int(fps),
+                )
 
-        profile = pipeline.start(rs_cfg)
-        self.pipeline = pipeline
+                profile = pipeline.start(rs_cfg)
+                self.pipeline = pipeline
+                self.color_enabled = bool(use_color)
+                self.use_ir_stream = bool(use_ir)
+                break
+            except Exception:
+                try:
+                    pipeline.stop()
+                except Exception:
+                    pass
+                continue
+
+        if profile is None:
+            raise RuntimeError("Could not start RealSense with any supported stream profile")
+
         self.depth_scale = profile.get_device().first_depth_sensor().get_depth_scale()
 
+        # Try high-accuracy preset (may fail on some platforms — non-fatal)
         try:
             profile.get_device().first_depth_sensor().set_option(
                 rs.option.visual_preset, 3
@@ -1596,11 +1680,15 @@ class VisionEngine:
         except Exception:
             pass
 
-        ir_prof = profile.get_stream(rs.stream.infrared, 1)
-        intr = ir_prof.as_video_stream_profile().get_intrinsics()
+        if self.use_ir_stream:
+            prof = profile.get_stream(rs.stream.infrared, 1)
+        else:
+            prof = profile.get_stream(rs.stream.color)
+        intr = prof.as_video_stream_profile().get_intrinsics()
         self.fx = intr.fx
         self.fy = intr.fy
 
+        # Depth ROI
         margin = int(self.config.DEPTH_ROI_PCT / 100.0 *
                       min(self.config.HEIGHT, self.config.WIDTH))
         cx = self.config.WIDTH // 2
@@ -1610,16 +1698,23 @@ class VisionEngine:
         dev_name = profile.get_device().get_info(rs.camera_info.name)
         serial = profile.get_device().get_info(rs.camera_info.serial_number)
         print(f"[D435i] {dev_name} (S/N: {serial})")
-        print(f"[D435i] Streams: IR + Color + Depth @ {self.config.WIDTH}x{self.config.HEIGHT}")
+        if self.use_ir_stream and self.color_enabled:
+            stream_desc = "IR + Color + Depth"
+        elif self.use_ir_stream:
+            stream_desc = "IR + Depth"
+        else:
+            stream_desc = "Color + Depth"
+        print(f"[D435i] Streams: {stream_desc} @ {self.config.WIDTH}x{self.config.HEIGHT}")
         print(f"[D435i] Intrinsics: fx={self.fx:.1f} fy={self.fy:.1f}")
         print(f"[D435i] Depth scale: {self.depth_scale}")
         self.state.update_telem(
             d435i_ok=True,
-            camera_source="d435i-color",
+            camera_source=("d435i-color" if self.color_enabled else "d435i-ir-only"),
             preflight_ready=False,
             preflight_message="Vision pipeline online; waiting for EKF / heartbeat",
         )
 
+        # Warm up — discard first frames
         for _ in range(30):
             try:
                 pipeline.wait_for_frames(timeout_ms=1000)
@@ -1635,14 +1730,22 @@ class VisionEngine:
         except RuntimeError:
             return False
 
-        ir_frame = frames.get_infrared_frame(1)
-        color_frame = frames.get_color_frame()
+        ir_frame = frames.get_infrared_frame(1) if self.use_ir_stream else None
+        color_frame = frames.get_color_frame() if self.color_enabled else None
         depth_frame = frames.get_depth_frame()
 
-        if not ir_frame or not depth_frame:
+        if not depth_frame:
             return False
 
-        gray = np.asanyarray(ir_frame.get_data())
+        gray = None
+        if ir_frame:
+            gray = np.asanyarray(ir_frame.get_data())
+        elif color_frame:
+            color_for_flow = np.asanyarray(color_frame.get_data())
+            gray = cv2.cvtColor(color_for_flow, cv2.COLOR_BGR2GRAY)
+
+        if gray is None:
+            return False
         depth_data = np.asanyarray(depth_frame.get_data())
         now = time.time()
 
@@ -1654,6 +1757,7 @@ class VisionEngine:
         if len(valid_depths) > 50:
             raw_alt = float(np.median(valid_depths)) * self.depth_scale
             if self.config.DEPTH_MIN < raw_alt < self.config.DEPTH_MAX:
+                # Reject impossible jumps
                 if (self.last_valid_alt > 0 and
                         abs(raw_alt - self.last_valid_alt) > self.config.DEPTH_MAX_JUMP):
                     pass  # skip outlier
@@ -1665,21 +1769,13 @@ class VisionEngine:
                         self.altitude = raw_alt
                     self.last_valid_alt = self.altitude
 
-        # ---- GET IMU ROTATION RATES FOR COMPENSATION ----
-        # FIX #1: Read body rotation rates to subtract from optical flow.
-        # Without this, every tilt creates a fake velocity → PRIMARY drift source.
-        telem_snapshot = self.state.get_telem()
-        # rollspeed and pitchspeed are in deg/s from the ATTITUDE message
-        body_rollspeed_rad = math.radians(float(telem_snapshot.get("rollspeed") or 0.0))
-        body_pitchspeed_rad = math.radians(float(telem_snapshot.get("pitchspeed") or 0.0))
-
         # ---- OPTICAL FLOW on IR ----
         vel_n = 0.0
         vel_e = 0.0
         dt = 0.0
         method = "IDLE"
         n_feat = 0
-        flow_vis = None
+        flow_vis = None  # for visualization
 
         if self.prev_gray is not None:
             dt = now - self.prev_time
@@ -1716,27 +1812,6 @@ class VisionEngine:
                                 med_dx = float(np.median(dx))
                                 med_dy = float(np.median(dy))
 
-                                # ================================================
-                                # FIX #1: IMU ROTATION COMPENSATION
-                                # ================================================
-                                # The optical flow measures apparent pixel motion which is
-                                # the SUM of (a) real translation and (b) camera rotation.
-                                # We must subtract the rotation component.
-                                #
-                                # For a downward-facing camera:
-                                #   pixel shift from rotation = angular_rate * focal_length * dt
-                                #   (in pixels)
-                                #
-                                # Camera X axis ≈ body Y (roll axis), Camera Y axis ≈ body X (pitch axis)
-                                # pitchspeed rotates the image in camera Y direction
-                                # rollspeed rotates the image in camera X direction
-                                rotation_dx = body_rollspeed_rad * self.fx * dt   # roll → camera X shift
-                                rotation_dy = body_pitchspeed_rad * self.fy * dt  # pitch → camera Y shift
-
-                                # Subtract rotation-induced flow
-                                med_dx -= rotation_dx
-                                med_dy -= rotation_dy
-
                                 flow_alt = self.altitude if self.altitude > 0.05 else 1.0
                                 vx_cam = (med_dx * flow_alt) / self.fx / dt
                                 vy_cam = (med_dy * flow_alt) / self.fy / dt
@@ -1749,7 +1824,7 @@ class VisionEngine:
                                 method = "SPARSE"
                                 n_feat = len(good_next)
 
-                # --- Dense Farneback FALLBACK ---
+                # --- Dense Farneback FALLBACK (only if sparse failed AND enabled) ---
                 if not sparse_ok and self.config.DENSE_FALLBACK:
                     flow = cv2.calcOpticalFlowFarneback(
                         self.prev_gray, gray, None,
@@ -1759,12 +1834,6 @@ class VisionEngine:
                     roi_flow = flow[m:gray.shape[0] - m, m:gray.shape[1] - m]
                     med_dx = float(np.median(roi_flow[:, :, 0]))
                     med_dy = float(np.median(roi_flow[:, :, 1]))
-
-                    # FIX #1: IMU compensation for dense flow too
-                    rotation_dx = body_rollspeed_rad * self.fx * dt
-                    rotation_dy = body_pitchspeed_rad * self.fy * dt
-                    med_dx -= rotation_dx
-                    med_dy -= rotation_dy
 
                     flow_alt = self.altitude if self.altitude > 0.05 else 1.0
                     vx_cam = (med_dx * flow_alt) / self.fx / dt
@@ -1776,6 +1845,8 @@ class VisionEngine:
                     vel_e = float(body_vel[0])
                     method = "DENSE"
                     n_feat = -1
+
+                    # Save dense flow for visualization
                     flow_vis = flow
 
         # Re-detect features if needed
@@ -1799,31 +1870,18 @@ class VisionEngine:
             vel_n *= scale
             vel_e *= scale
 
-        # Reject low-altitude noise
+        # Reject low-altitude/noise updates that commonly cause horizontal drift.
         if self.altitude < self.config.FLOW_MIN_VALID_ALT:
             vel_n = 0.0
             vel_e = 0.0
             if method in ("SPARSE", "DENSE"):
                 method = "IDLE"
 
-        # Deadband
+        # Deadband tiny residual velocities from camera noise/vibration.
         if abs(vel_n) < self.config.FLOW_DEADBAND_MPS:
             vel_n = 0.0
         if abs(vel_e) < self.config.FLOW_DEADBAND_MPS:
             vel_e = 0.0
-
-        # ---- FIX #10: EMA LOW-PASS FILTER on velocity ----
-        # Smooths out frame-to-frame spikes before Kalman even sees them
-        alpha = self.config.FLOW_EMA_ALPHA
-        if method in ("SPARSE", "DENSE"):
-            self.ema_vel_n = alpha * vel_n + (1.0 - alpha) * self.ema_vel_n
-            self.ema_vel_e = alpha * vel_e + (1.0 - alpha) * self.ema_vel_e
-            vel_n = self.ema_vel_n
-            vel_e = self.ema_vel_e
-        else:
-            # Decay EMA toward zero when idle
-            self.ema_vel_n *= self.config.VEL_DAMP_IDLE
-            self.ema_vel_e *= self.config.VEL_DAMP_IDLE
 
         # ---- KALMAN FILTER ----
         if dt > 0:
@@ -1845,12 +1903,8 @@ class VisionEngine:
         kvy = float(self.kalman.x[3])
 
         # ---- SEND TO PIXHAWK ----
-        # FIX #2: Send position + distance ONLY. Do NOT also send vision_speed.
-        # Sending both position and speed from the same source causes the EKF to
-        # double-count our measurements (they're correlated!), amplifying drift.
-        # The EKF will derive velocity from consecutive position estimates itself.
         self.mav.send_vision_position(kx, ky, -self.altitude)
-        # REMOVED: self.mav.send_vision_speed(kvx, kvy, 0.0)
+        self.mav.send_vision_speed(kvx, kvy, 0.0)
         if self.altitude > 0:
             self.mav.send_distance(int(self.altitude * 100))
         self.mav.send_heartbeat()
@@ -1883,10 +1937,14 @@ class VisionEngine:
         if now - self.last_web_frame >= 1.0 / self.config.WEB_FEED_FPS:
             self.last_web_frame = now
 
+            # Color feed with HUD
+            # pyrealsense2 pip package sometimes doesn't deliver color frames
+            # Fall back to colorized IR if color is unavailable
             color_img = None
             if color_frame:
                 color_img = np.asanyarray(color_frame.get_data())
             elif gray is not None:
+                # Fallback: convert grayscale IR to BGR so HUD renders properly
                 color_img = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
             if color_img is not None:
@@ -1903,6 +1961,7 @@ class VisionEngine:
                     source=src,
                 )
 
+            # Optical flow visualization
             flow_img = self._draw_flow_vis(
                 gray, method, n_feat, flow_vis, kx, ky, kvx, kvy
             )
@@ -1915,31 +1974,37 @@ class VisionEngine:
         return True
 
     def _draw_color_hud(self, img, kx, ky, kvx, kvy, method, fq):
+        """Draw heads-up display on color frame."""
         h, w = img.shape[:2]
         cx, cy = w // 2, h // 2
 
+        # Crosshair
         cv2.line(img, (cx - 25, cy), (cx - 8, cy), (0, 255, 0), 1)
         cv2.line(img, (cx + 8, cy), (cx + 25, cy), (0, 255, 0), 1)
         cv2.line(img, (cx, cy - 25), (cx, cy - 8), (0, 255, 0), 1)
         cv2.line(img, (cx, cy + 8), (cx, cy + 25), (0, 255, 0), 1)
 
+        # Corner brackets
         bsz = 30
         for bx, by, dx, dy in [(0, 0, 1, 1), (w, 0, -1, 1),
                                  (0, h, 1, -1), (w, h, -1, -1)]:
             cv2.line(img, (bx, by), (bx + dx * bsz, by), (0, 255, 0), 1)
             cv2.line(img, (bx, by), (bx, by + dy * bsz), (0, 255, 0), 1)
 
+        # Velocity arrow
         arrow_scale = 80
         ax = int(cx + kvy * arrow_scale)
         ay = int(cy - kvx * arrow_scale)
         cv2.arrowedLine(img, (cx, cy), (ax, ay), (0, 140, 255), 2)
 
+        # Altitude bar
         if self.altitude > 0:
             bar_max_h = h - 40
             bar_h = int(min(self.altitude / 10.0, 1.0) * bar_max_h)
             cv2.rectangle(img, (w - 22, h - 20 - bar_h), (w - 8, h - 20),
                           (0, 255, 255), -1)
 
+        # Text overlay
         color_ok = (0, 255, 0) if fq > 60 else (0, 200, 255) if fq > 30 else (0, 0, 255)
         texts = [
             f"ALT {self.altitude:.2f}m",
@@ -1952,14 +2017,17 @@ class VisionEngine:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, color_ok, 1)
 
     def _draw_flow_vis(self, gray, method, n_feat, dense_flow, kx, ky, kvx, kvy):
+        """Create optical flow visualization image."""
         vis = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
         h, w = vis.shape[:2]
 
+        # Draw tracked features
         if self.prev_points is not None and method == "SPARSE":
             for pt in self.prev_points:
                 x, y = int(pt[0][0]), int(pt[0][1])
                 cv2.circle(vis, (x, y), 2, (0, 255, 0), -1)
 
+        # Draw dense flow as color wheel
         if dense_flow is not None and method == "DENSE":
             mag, ang = cv2.cartToPolar(dense_flow[:, :, 0], dense_flow[:, :, 1])
             hsv = np.zeros((h, w, 3), dtype=np.uint8)
@@ -1969,9 +2037,11 @@ class VisionEngine:
             flow_bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
             vis = cv2.addWeighted(vis, 0.5, flow_bgr, 0.5, 0)
 
+        # Depth ROI box
         y1, y2, x1, x2 = self.roi
         cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 255), 1)
 
+        # Info
         cv2.putText(vis, f"OPTICAL FLOW: {method}", (8, 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
         cv2.putText(vis, f"Features: {n_feat}", (8, 38),
@@ -2009,6 +2079,7 @@ def vision_thread(config, state, mav, stop_event):
                 preflight_ready=False,
                 preflight_message="Vision pipeline unavailable",
             )
+            # Still run MAVLink reads without camera
             while not stop_event.is_set():
                 mav.read_messages()
                 mav.send_heartbeat()
@@ -2108,9 +2179,6 @@ def demo_thread(state, stop_event):
             camera_source="demo",
             preflight_ready=True,
             preflight_message="Demo mode active",
-            rollspeed=math.sin(t * 0.7) * 5.0,
-            pitchspeed=math.cos(t * 0.6) * 4.0,
-            yawspeed=math.sin(t * 0.3) * 2.0,
         )
         time.sleep(0.1)
 
@@ -2122,7 +2190,7 @@ app = Flask(__name__)
 CORS(app)
 telemetry_state = TelemetryState()
 state = telemetry_state
-mav_handler = None
+mav_handler = None  # set in main
 
 
 def _json_response(payload, status=200):
@@ -2281,6 +2349,7 @@ def api_disarm():
 def api_force_disarm():
     data = request.get_json(silent=True) or {}
     confirm = data.get("confirm") or request.args.get("confirm", "")
+    # Accept: {"confirm": true}, {"confirm": "FORCE"}, ?confirm=FORCE
     if confirm not in (True, "true", "FORCE", "force"):
         return _json_response(
             {"ok": False, "msg": "Confirmation required: send {'confirm': true}"},
@@ -2320,6 +2389,9 @@ def api_land():
 
 @app.route("/api/arm_and_takeoff", methods=["POST"])
 def api_arm_and_takeoff():
+    """One-click ARM → GUIDED → TAKEOFF sequence.
+    This is the correct sequence for companion-computer controlled flight.
+    Doing these as separate button clicks causes the drone to disarm between steps."""
     if not mav_handler:
         return _json_response({"ok": False, "msg": "No MAVLink connection"})
 
@@ -2327,11 +2399,13 @@ def api_arm_and_takeoff():
     altitude = data.get("altitude", 4.0)
     steps = []
 
+    # Step 1: ARM (this also sends RC override)
     ok, msg = mav_handler.arm()
     steps.append(f"ARM: {msg}")
     if not ok:
         return _json_response({"ok": False, "msg": " → ".join(steps)})
 
+    # Step 2: TAKEOFF (internally sets GUIDED + sends takeoff command)
     deadline = time.time() + 1.5
     while time.time() < deadline:
         snap = mav_handler._read_state()
@@ -2354,6 +2428,7 @@ def api_set_mode(mode_name):
 
 @app.route("/api/rc", methods=["POST"])
 def api_rc_override():
+    """POST JSON: {"1": 1500, "2": 1500, "3": 1200, "4": 1500}"""
     if mav_handler:
         data = request.get_json(silent=True) or {}
         ok, msg = mav_handler.set_rc_override(data)
@@ -2370,6 +2445,8 @@ def api_rc_release():
 
 
 def _mjpeg_stream(frame_getter):
+    """Generate MJPEG stream from a frame getter function."""
+    # Generate a 1x1 black JPEG as placeholder so the stream doesn't hang
     _placeholder = None
     while True:
         frame = frame_getter()
@@ -2378,6 +2455,8 @@ def _mjpeg_stream(frame_getter):
                    b"Content-Type: image/jpeg\r\n\r\n" +
                    frame + b"\r\n")
         else:
+            # Send a tiny placeholder so the MJPEG stream stays alive
+            # and the browser doesn't timeout waiting for first frame
             if _placeholder is None:
                 try:
                     import numpy as np
@@ -2458,7 +2537,7 @@ def main():
 
     print()
     print("=" * 60)
-    print("  ASCEND GCS — Ground Control System  [PATCHED]")
+    print("  ASCEND GCS — Ground Control System")
     print("  Team Saarabai X · IRoC-U 2026")
     print("  Bennett University · Technotix")
     print("=" * 60)
@@ -2471,6 +2550,7 @@ def main():
             target=demo_thread, args=(state, stop_event), daemon=True
         ).start()
     else:
+        # Print required ArduPilot parameters (verified from official docs)
         print("  ┌─── REQUIRED PIXHAWK PARAMETERS (GNSS-denied) ───────────────┐")
         print("  │ Set these in Mission Planner BEFORE flight:                  │")
         print("  │                                                              │")
@@ -2495,21 +2575,49 @@ def main():
         print("  └──────────────────────────────────────────────────────────────┘")
         print()
 
+        # Connect to Pixhawk
         mav_handler = MAVLinkHandler(config, state)
+        vision_mav = mav_handler
         if not mav_handler.connect():
             print()
-            print("[FATAL] Cannot connect to Pixhawk.")
-            print(f"[FATAL] Tried: {config.SERIAL_PORT} @ {config.BAUD_RATE}")
+            print("[WARN] Pixhawk not connected. Starting vision-only mode.")
+            print(f"[WARN] Tried: {config.SERIAL_PORT} @ {config.BAUD_RATE}")
             if os.name == "nt":
                 print("[HINT] Windows: Check COM port in Device Manager")
                 print("[HINT] Example: python ascend_gcs.py --serial COM13")
             else:
                 print("[HINT] Linux: ls /dev/ttyACM* /dev/ttyUSB*")
-            sys.exit(1)
 
+            class _VisionOnlyMAV:
+                connected = False
+
+                def send_vision_position(self, x, y, z):
+                    return
+
+                def send_vision_speed(self, vx, vy, vz):
+                    return
+
+                def send_distance(self, dist_cm):
+                    return
+
+                def send_heartbeat(self):
+                    return
+
+                def read_messages(self):
+                    return
+
+            vision_mav = _VisionOnlyMAV()
+            mav_handler = None
+            state.update_telem(
+                pixhawk_ok=False,
+                preflight_ready=False,
+                preflight_message="Vision-only mode: Pixhawk not connected",
+            )
+
+        # Start vision thread (with real MAVLink when available, else no-op MAV shim)
         threading.Thread(
             target=vision_thread,
-            args=(config, state, mav_handler, stop_event),
+            args=(config, state, vision_mav, stop_event),
             daemon=True,
         ).start()
 
@@ -2524,6 +2632,7 @@ def main():
     print("  Press Ctrl+C to stop")
     print()
 
+    # Start Flask
     app.run(host="0.0.0.0", port=config.WEB_PORT,
             threaded=True, use_reloader=False)
 
